@@ -21,6 +21,30 @@ type storedAuth struct {
 	ProjectID string `json:"projectId,omitempty"`
 }
 
+// rememberProjectID writes the project id back into the credential file so it
+// survives a restart. Re-deriving it costs a lookup against prism's project
+// list, which is both slower and, measured 2026-09-17, the one endpoint that
+// kept timing out while the rest of prism answered normally.
+func rememberProjectID(sa *storedAuth, projectID string) {
+	if sa == nil || projectID == "" || sa.ProjectID == projectID {
+		return
+	}
+	sa.ProjectID = projectID
+	auth := &authData{
+		Provider:    providerName,
+		Label:       "prism (browser sign-in)",
+		Prefix:      "prism",
+		FileName:    credentialFileName,
+		StorageJSON: sa.encode(),
+	}
+	if err := saveHostAuth(auth); err != nil {
+		// Losing this only costs a lookup next start; the turn itself is fine.
+		hostLog("warn", "把项目 ID 写回凭据失败", map[string]any{"error": err.Error()})
+		return
+	}
+	hostLog("info", "项目 ID 已写回凭据", map[string]any{"project": projectID})
+}
+
 // importFile is the shape accepted by `auth.parse` — a hand-written JSON file
 // the operator drops into CPA's auth directory.
 type importFile struct {

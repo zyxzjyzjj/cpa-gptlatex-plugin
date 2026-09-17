@@ -199,6 +199,10 @@ type prismClient struct {
 	// credKey identifies the credential this client speaks for, so an
 	// auto-created project can be reused across requests.
 	credKey string
+	// auth is the credential this client was built from. It is kept so a
+	// project created here can be written back to the credential file and
+	// reused after a restart.
+	auth *storedAuth
 }
 
 func newPrismClient(sa *storedAuth) (*prismClient, error) {
@@ -210,6 +214,7 @@ func newPrismClient(sa *storedAuth) (*prismClient, error) {
 		cookies:   sa.Cookies,
 		projectID: sa.ProjectID,
 		userID:    sa.UserID,
+		auth:      sa,
 		credKey:   credentialKey(sa.Cookies),
 	}, nil
 }
@@ -326,16 +331,12 @@ func (c *prismClient) ensureProject(ctx context.Context) (string, error) {
 		return cached, nil
 	}
 
-	// Reuse a project this plugin created earlier rather than minting another
-	// one on every restart: the cache above is in memory, so without this each
-	// CPA restart left another workspace behind (14 had piled up by 2026-09-17).
-	if id, err := c.findOwnProject(ctx, cfg.ProjectTitle); err == nil && id != "" {
-		hostLog("info", "复用已有的 prism 项目", map[string]any{"project": id})
-		c.projectID = id
-		rememberProject(c.credKey, id)
-		return id, nil
-	}
-
+	// Creating one is cheap and, unlike the list endpoint, was the reliable call
+	// during prism's 2026-09-17 storage incident (create answered 200 while
+	// /api/file-management/projects kept timing out). The id is written back to
+	// the credential below, so this happens once per credential rather than
+	// once per process start — before that, each restart left another project
+	// behind and 14 had accumulated.
 	id := newUUID()
 	body := map[string]any{
 		"project_uuid": id,
@@ -345,26 +346,34 @@ func (c *prismClient) ensureProject(ctx context.Context) (string, error) {
 	var resp struct {
 		UUID string `json:"uuid"`
 	}
-	if err := c.do(ctx, http.MethodPost, "/api/projects", body, &resp); err != nil {
-		// Prism answers 503 "Project storage is temporarily unavailable" on
-		// creation while reads keep working, and a turn needs *a* project, not
-		// a fresh one — nothing in a turn depends on the workspace contents.
+	if err := c.do(ctx, http.MethodPost, "/api/projects", body, &resp); err == nil {
+		if resp.UUID == "" {
+			resp.UUID = id
+		}
+		c.setProject(resp.UUID)
+		return c.projectID, nil
+	} else {
+		// A turn needs *a* project, not a fresh one — nothing in a turn depends
+		// on the workspace contents — so an existing project is a fine fallback
+		// when creation is refused.
 		hostLog("warn", "创建 prism 项目失败，改用已有项目", map[string]any{"error": err.Error()})
+		// Any project will do here: the turn needs a workspace id, not this
+		// plugin's own workspace, so an unrelated project beats failing.
 		fallback, fallbackErr := c.findOwnProject(ctx, "")
 		if fallbackErr != nil || fallback == "" {
 			return "", fmt.Errorf("创建 prism 项目失败: %w", err)
 		}
 		hostLog("info", "复用账户里已有的 prism 项目", map[string]any{"project": fallback})
-		c.projectID = fallback
-		rememberProject(c.credKey, fallback)
-		return fallback, nil
+		c.setProject(fallback)
+		return c.projectID, nil
 	}
-	if resp.UUID == "" {
-		resp.UUID = id
-	}
-	c.projectID = resp.UUID
-	rememberProject(c.credKey, resp.UUID)
-	return c.projectID, nil
+}
+
+// setProject records the project for this credential in memory and on disk.
+func (c *prismClient) setProject(id string) {
+	c.projectID = id
+	rememberProject(c.credKey, id)
+	rememberProjectID(c.auth, id)
 }
 
 // findOwnProject returns the newest existing project, preferring one whose

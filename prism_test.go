@@ -423,20 +423,19 @@ func TestCloudflareErrorsAreReportedByCause(t *testing.T) {
 	}
 }
 
-// prism creates a project per call unless one is reused, and the in-memory
-// cache does not survive a restart, so ensureProject has to find its own work.
-func TestEnsureProjectReusesOwnProject(t *testing.T) {
+// Creating a project is the reliable call (during prism's 2026-09-17 storage
+// incident create answered 200 while the list endpoint timed out), so a client
+// with no project uses it rather than searching first.
+func TestEnsureProjectCreatesRatherThanSearching(t *testing.T) {
 	withFreshProjectCache(t)
 
-	var created int
+	var listed int
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.URL.Path == "/api/file-management/projects":
-			_, _ = w.Write([]byte(`{"projects":[{"uuid":"newest","title":"CLIProxyAPI"},
-			                                        {"uuid":"older","title":"CLIProxyAPI"},
-			                                        {"uuid":"mine","title":"我的论文"}]}`))
+			listed++
+			_, _ = w.Write([]byte(`{"projects":[{"uuid":"newest","title":"CLIProxyAPI"}]}`))
 		case r.URL.Path == "/api/projects":
-			created++
 			_, _ = w.Write([]byte(`{"uuid":"fresh"}`))
 		default:
 			http.NotFound(w, r)
@@ -449,17 +448,48 @@ func TestEnsureProjectReusesOwnProject(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newPrismClient: %v", err)
 	}
-	cfg := defaultConfig()
-	withConfig(t, cfg, func() {
+	withConfig(t, defaultConfig(), func() {
 		got, err := client.ensureProject(context.Background())
 		if err != nil {
 			t.Fatalf("ensureProject: %v", err)
 		}
-		if got != "newest" {
-			t.Errorf("project = %q, want the newest project this plugin created", got)
+		if got != "fresh" {
+			t.Errorf("project = %q, want the created project", got)
 		}
-		if created != 0 {
-			t.Errorf("created %d projects, want 0", created)
+		if listed != 0 {
+			t.Errorf("listed projects %d times, want 0", listed)
+		}
+	})
+}
+
+// The project id travels in the credential file, so a restart does not have to
+// rediscover it -- and does not leave another project behind.
+func TestEnsureProjectUsesCredentialProjectWithoutNetwork(t *testing.T) {
+	withFreshProjectCache(t)
+
+	var calls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		http.NotFound(w, r)
+	}))
+	defer server.Close()
+	withBaseURL(t, server.URL)
+
+	sa := &storedAuth{Cookies: "c=1", ProjectID: "from-credential"}
+	client, err := newPrismClient(sa)
+	if err != nil {
+		t.Fatalf("newPrismClient: %v", err)
+	}
+	withConfig(t, defaultConfig(), func() {
+		got, err := client.ensureProject(context.Background())
+		if err != nil {
+			t.Fatalf("ensureProject: %v", err)
+		}
+		if got != "from-credential" {
+			t.Errorf("project = %q, want the one from the credential", got)
+		}
+		if calls != 0 {
+			t.Errorf("made %d requests, want 0", calls)
 		}
 	})
 }
