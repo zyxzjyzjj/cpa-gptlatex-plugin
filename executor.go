@@ -66,6 +66,9 @@ func handleExecute(raw []byte, stream bool) ([]byte, error) {
 	}
 
 	cfg := currentConfig()
+	// 冷启动要付沙箱握手（实测 42s：资源令牌 → y-sweet → Yjs 同步），
+	// 缓存命中后同一轮只要几秒。所以这里的耗时按阶段打点，便于判断慢在哪。
+	sandboxMS := int64(0)
 	metadata := map[string]any{
 		"projectId":        projectID,
 		"userId":           client.userID,
@@ -75,27 +78,46 @@ func handleExecute(raw []byte, stream bool) ([]byte, error) {
 	}
 	// 沙箱凭证必须放进 metadata，服务端 Agent 才有工具执行环境（读写 .tex、编译 PDF）。
 	// 实测 metadata.sandbox_url 用公开地址即可，服务端在 turn_state 里会换成内部集群地址。
-	if cfg.EnableSandbox {
+	attachSandbox := func() error {
+		mark := time.Now()
 		sb, sbErr := client.ensureSandbox(ctx, projectID)
 		if sbErr != nil {
 			hostLog("error", "prism 沙箱领取失败", map[string]any{
-				"project": projectID,
-				"error":   sbErr.Error(),
+				"project":    projectID,
+				"error":      sbErr.Error(),
+				"elapsed_ms": time.Since(started).Milliseconds(),
 			})
-			return errorEnvelope("upstream_error", sbErr.Error(), http.StatusBadGateway), nil
+			return sbErr
 		}
 		metadata["sandbox_url"] = sb.URL
 		metadata["sandbox_token"] = sb.Token
+		sandboxMS += time.Since(mark).Milliseconds()
 		hostLog("info", "prism 沙箱就绪", map[string]any{
 			"project":    projectID,
-			"url":        sb.URL,
+			"cached":     !sb.provisioned,
 			"elapsed_ms": time.Since(started).Milliseconds(),
 		})
+		return nil
+	}
+	if cfg.EnableSandbox {
+		if err := attachSandbox(); err != nil {
+			return errorEnvelope("upstream_error", err.Error(), http.StatusBadGateway), nil
+		}
 	}
 
 	turn := turnRequest{Input: input, Metadata: metadata}
 
-	payload, err := client.runTurn(ctx, turn, 5*time.Second, nil)
+	payload, err := client.runTurn(ctx, turn, 5*time.Second, func() {
+		// 服务端要求重连时缓存的沙箱已经没用了。丢掉之后必须重新领一个并
+		// 覆盖 metadata，否则重试还是带着同一个死沙箱，只会再失败一次。
+		if !cfg.EnableSandbox {
+			return
+		}
+		dropSandbox(projectID)
+		if err := attachSandbox(); err != nil {
+			hostLog("error", "重连时重新领取 prism 沙箱失败", map[string]any{"error": err.Error()})
+		}
+	})
 	if err != nil {
 		fields := map[string]any{
 			"model":      model,
@@ -134,6 +156,8 @@ func handleExecute(raw []byte, stream bool) ([]byte, error) {
 		"project":     projectID,
 		"response_id": payload.ID,
 		"chars":       len(text),
+		"sandbox_ms":  sandboxMS,
+		"turn_ms":     time.Since(started).Milliseconds() - sandboxMS,
 		"elapsed_ms":  time.Since(started).Milliseconds(),
 	})
 

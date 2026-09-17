@@ -886,6 +886,79 @@ func TestRealSandboxReconnectingPayloadIsRetryable(t *testing.T) {
 	}
 }
 
+// A retry has to run against a fresh sandbox: prism answers
+// sandbox_reconnecting for a sandbox that is gone, and resending the same one
+// just fails again (measured live 2026-09-17 — three attempts, three
+// reconnecting results). The callback is what lets the caller drop and
+// re-provision, so it must fire on every retryable result.
+func TestRunTurnAsksForANewSandboxOnEachRetry(t *testing.T) {
+	var starts int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/llm/response_with_tools_start" {
+			http.NotFound(w, r)
+			return
+		}
+		starts++
+		if starts < 3 {
+			_, _ = w.Write([]byte(`{"status":"completed","request_id":"r1",` +
+				`"response":{"status":"error","payload":{"reason":"sandbox_reconnecting",` +
+				`"message":"Reconnecting to sandbox."}}}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"status":"completed","request_id":"r2",` +
+			`"response":{"status":"success","payload":{"id":"resp_1","output":[]}}}`))
+	}))
+	defer server.Close()
+	withBaseURL(t, server.URL)
+
+	client, err := newPrismClient(&storedAuth{Cookies: "c=1"})
+	if err != nil {
+		t.Fatalf("newPrismClient: %v", err)
+	}
+
+	var retries int
+	payload, err := client.runTurn(context.Background(),
+		turnRequest{Input: []map[string]any{}, Metadata: map[string]any{}},
+		time.Millisecond,
+		func() { retries++ })
+	if err != nil {
+		t.Fatalf("runTurn: %v", err)
+	}
+	if payload.ID != "resp_1" {
+		t.Errorf("payload id = %q, want resp_1", payload.ID)
+	}
+	if retries != 2 {
+		t.Errorf("retry callback fired %d times, want 2", retries)
+	}
+	if starts != 3 {
+		t.Errorf("start called %d times, want 3", starts)
+	}
+}
+
+// The retry callback must not be needed when the first attempt succeeds.
+func TestRunTurnDoesNotRetryOnSuccess(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"status":"completed","request_id":"r1",` +
+			`"response":{"status":"success","payload":{"id":"resp_ok","output":[]}}}`))
+	}))
+	defer server.Close()
+	withBaseURL(t, server.URL)
+
+	client, err := newPrismClient(&storedAuth{Cookies: "c=1"})
+	if err != nil {
+		t.Fatalf("newPrismClient: %v", err)
+	}
+	retried := false
+	if _, err := client.runTurn(context.Background(),
+		turnRequest{Input: []map[string]any{}, Metadata: map[string]any{}},
+		time.Millisecond, func() { retried = true }); err != nil {
+		t.Fatalf("runTurn: %v", err)
+	}
+	if retried {
+		t.Error("retry callback fired on a successful turn")
+	}
+}
+
 // ------------------------------------------------------- y-sweet handshake
 
 // These exact frames were sent to the live provider on 2026-09-17 and got the

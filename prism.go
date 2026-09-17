@@ -560,10 +560,19 @@ func (c *prismClient) pollTurn(ctx context.Context, requestID string, turnState 
 // runTurn drives one full assistant turn: start, then poll until the server
 // reports completion. Mirrors the web client's start/poll/reconnect loop — a
 // SandboxReconnecting result is retried rather than surfaced as a failure.
-func (c *prismClient) runTurn(ctx context.Context, req turnRequest, poll time.Duration, onProgress func(string)) (*turnPayload, error) {
+//
+// onRetry, when set, is called with the project id after a reconnecting result
+// so the caller can drop the sandbox that just failed. Retrying against the
+// same dead sandbox can never succeed; prism says "your request will resume
+// automatically", but that only holds for the web client, which still has a
+// live workspace socket. Measured 2026-09-17: three attempts against a stale
+// cached sandbox all returned sandbox_reconnecting, and only re-provisioning
+// produced an answer.
+func (c *prismClient) runTurn(ctx context.Context, req turnRequest, poll time.Duration, onRetry func()) (*turnPayload, error) {
 	if poll <= 0 {
 		poll = 5 * time.Second
 	}
+	var lastErr error
 	for attempt := 0; attempt < 3; attempt++ {
 		payload, err := c.runOnce(ctx, req, poll)
 		if err == nil {
@@ -572,8 +581,10 @@ func (c *prismClient) runTurn(ctx context.Context, req turnRequest, poll time.Du
 		if !errors.Is(err, errSandboxReconnecting) {
 			return nil, err
 		}
-		if onProgress != nil {
-			onProgress("等待 prism 沙箱就绪…")
+		lastErr = err
+		hostLog("warn", "prism 要求重连沙箱，重新领取后重试", map[string]any{"attempt": attempt + 1})
+		if onRetry != nil {
+			onRetry()
 		}
 		select {
 		case <-ctx.Done():
@@ -581,7 +592,7 @@ func (c *prismClient) runTurn(ctx context.Context, req turnRequest, poll time.Du
 		case <-time.After(poll):
 		}
 	}
-	return nil, fmt.Errorf("prism 沙箱反复重连失败，请稍后重试")
+	return nil, lastErr
 }
 
 func (c *prismClient) runOnce(ctx context.Context, req turnRequest, poll time.Duration) (*turnPayload, error) {
@@ -735,6 +746,10 @@ type sandboxSession struct {
 	// yjs holds the provider socket open. It must outlive the turn: dropping it
 	// puts the sandbox back into "syncing".
 	yjs *yjsSession
+	// provisioned records whether this session was built now (false when it came
+	// from the cache), which is what tells a slow first request from a slow
+	// upstream.
+	provisioned bool
 
 	expires time.Time
 }
@@ -753,9 +768,13 @@ type yjsCredentials struct {
 	Authorization string `json:"authorization"`
 }
 
-// sandboxTTL is a conservative reuse window: re-provisioning costs seconds, and
-// the y-sweet socket is only useful while its sandbox lives.
-const sandboxTTL = 10 * time.Minute
+// sandboxTTL is how long a provisioned sandbox is reused before the next turn
+// pays the handshake again. That handshake is the single biggest cost of a
+// request — measured 42s on 2026-09-17, against 20s for a fully cached turn —
+// and the y-sweet socket is pinged every 30s to keep it alive, so the window is
+// worth making generous. Expiring early is not fatal: a sandbox prism has
+// already dropped answers sandbox_reconnecting and the turn re-provisions.
+const sandboxTTL = 45 * time.Minute
 
 // waitForSyncBudget bounds how long we wait for the workspace to report synced.
 const waitForSyncBudget = 60 * time.Second
@@ -803,7 +822,7 @@ func (c *prismClient) provisionSandbox(ctx context.Context, projectID string) (*
 	if created.URL == "" || created.Token == "" {
 		return nil, fmt.Errorf("领取 prism 沙箱返回缺少 url/token")
 	}
-	session := &sandboxSession{URL: created.URL, Token: created.Token, bust: newCacheBust()}
+	session := &sandboxSession{URL: created.URL, Token: created.Token, bust: newCacheBust(), provisioned: true}
 	if !strings.HasSuffix(session.URL, "/") {
 		session.URL += "/"
 	}
