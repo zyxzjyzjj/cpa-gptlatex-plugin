@@ -206,6 +206,15 @@ func newPrismClient(sa *storedAuth) (*prismClient, error) {
 	if strings.TrimSpace(sa.Cookies) == "" {
 		return nil, fmt.Errorf("缺少 prism cookie")
 	}
+	// The credential is authoritative, but the config's user_id / project_uuid
+	// are a documented way to skip the two lookups that would otherwise run on
+	// every start. Without this fallback those knobs did nothing at all.
+	if sa.UserID == "" {
+		sa.UserID = currentConfig().UserID
+	}
+	if sa.ProjectID == "" {
+		sa.ProjectID = currentConfig().ProjectUUID
+	}
 	return &prismClient{
 		http:      &http.Client{Timeout: 180 * time.Second},
 		cookies:   sa.Cookies,
@@ -747,8 +756,54 @@ type sandboxSession struct {
 	// yjs holds the provider socket open. It must outlive the turn: dropping it
 	// puts the sandbox back into "syncing".
 	yjs *yjsSession
+	// stopHeartbeat ends the keep-alive goroutine when the session is replaced.
+	stopHeartbeat context.CancelFunc
 
 	expires time.Time
+}
+
+// keepAlive pings the sandbox so it is not torn down between turns.
+//
+// This is not optional. The web client sends GET {sandbox}heartbeat with
+// X-Crixet-Sandbox-Token every 10 seconds (HEARTBEAT_INTERVAL_MS), and a
+// sandbox that stops receiving them is reclaimed server-side. Without this the
+// cached sandbox was dead within about a minute, and every later turn failed
+// with prism's opaque "Error while processing conversation, please submit
+// prompt again." — which is why caching looked like it made things worse.
+//
+// A 502 with x-crixet-sandbox-expired: true means the sandbox is gone for good;
+// the caller notices on the next turn because the session is dropped here.
+func (c *prismClient) keepAlive(session *sandboxSession, projectID string) {
+	ctx, cancel := context.WithCancel(context.Background())
+	session.stopHeartbeat = cancel
+	// Read once, here: the goroutine must not re-read a variable a test may
+	// restore while it is still running.
+	interval := heartbeatInterval
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
+			reqCtx, reqCancel := context.WithTimeout(ctx, heartbeatTimeout)
+			// The body is plain text ("OK"), not JSON: decoding it made every
+			// heartbeat look like a failure and threw away a healthy sandbox.
+			err := c.doSandbox(reqCtx, http.MethodGet,
+				session.urlWithBust("heartbeat"), session.Token, nil, nil)
+			reqCancel()
+			if err == nil {
+				continue
+			}
+			// A dead sandbox is not an error to report here: the next turn
+			// either reconnects or fails with a message the operator can act on.
+			hostLog("warn", "prism 沙箱心跳失败，丢弃缓存 error="+err.Error(), nil)
+			dropSandbox(projectID)
+			return
+		}
+	}()
 }
 
 func (s *sandboxSession) urlWithBust(path string) string {
@@ -765,13 +820,21 @@ type yjsCredentials struct {
 	Authorization string `json:"authorization"`
 }
 
-// sandboxTTL is how long a provisioned sandbox is reused before the next turn
-// pays the handshake again. That handshake is the single biggest cost of a
-// request — measured 42s on 2026-09-17, against 20s for a fully cached turn —
-// and the y-sweet socket is pinged every 30s to keep it alive, so the window is
-// worth making generous. Expiring early is not fatal: a sandbox prism has
-// already dropped answers sandbox_reconnecting and the turn re-provisions.
+// sandboxTTL bounds reuse of a provisioned sandbox. The window is only safe
+// because the session heartbeats: a sandbox with no heartbeat is torn down
+// server-side within a minute or so, and handing prism a dead one is what
+// produces the opaque "Error while processing conversation" failures. See
+// sandboxSession.keepAlive.
 const sandboxTTL = 45 * time.Minute
+
+// heartbeatInterval mirrors the web client's HEARTBEAT_INTERVAL_MS = 1e4. The
+// endpoint blocks for seconds (4–19s measured), so the ping runs on its own
+// goroutine rather than in the request path. It is a var so tests do not have
+// to sleep for real seconds.
+var heartbeatInterval = 10 * time.Second
+
+// heartbeatTimeout matches the client's 25s abort for this call.
+const heartbeatTimeout = 25 * time.Second
 
 // waitForSyncBudget bounds how long we wait for the workspace to report synced.
 const waitForSyncBudget = 60 * time.Second
@@ -794,9 +857,7 @@ func (c *prismClient) ensureSandbox(ctx context.Context, projectID string) (*san
 	stale := sandboxCache[projectID]
 	delete(sandboxCache, projectID)
 	sandboxMu.Unlock()
-	if stale != nil {
-		stale.yjs.close()
-	}
+	stopSandbox(stale)
 
 	session, err := c.provisionSandbox(ctx, projectID)
 	if err != nil {
@@ -847,6 +908,9 @@ func (c *prismClient) provisionSandbox(ctx context.Context, projectID string) (*
 		yjs.close()
 		return nil, err
 	}
+	// Start pinging before the session is published: without it the sandbox is
+	// reclaimed between turns and the cache becomes a liability.
+	c.keepAlive(session, projectID)
 	session.expires = time.Now().Add(sandboxTTL)
 	return session, nil
 }
@@ -954,9 +1018,20 @@ func dropSandbox(projectID string) {
 	stale := sandboxCache[projectID]
 	delete(sandboxCache, projectID)
 	sandboxMu.Unlock()
-	if stale != nil {
-		stale.yjs.close()
+	stopSandbox(stale)
+}
+
+// stopSandbox ends a session's heartbeat and socket. Both are goroutines that
+// outlive the call that started them, so every path that drops a session has to
+// go through here or they leak.
+func stopSandbox(session *sandboxSession) {
+	if session == nil {
+		return
 	}
+	if session.stopHeartbeat != nil {
+		session.stopHeartbeat()
+	}
+	session.yjs.close()
 }
 
 // newCacheBust mirrors prism's own cache-buster: a fixed random number per

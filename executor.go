@@ -207,7 +207,7 @@ func (c *prismClient) hydrate(ctx context.Context, sa *storedAuth) error {
 		return fmt.Errorf("无法从 /auth/session 解析 OpenAI user id")
 	}
 	c.userID = id
-	sa.UserID = id
+	rememberUserID(sa, id)
 	return nil
 }
 

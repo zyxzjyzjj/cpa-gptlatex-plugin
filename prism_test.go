@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -1033,12 +1034,120 @@ func TestEnsureSandboxDropsStaleEntry(t *testing.T) {
 	}
 }
 
+// fastHeartbeat shortens the keep-alive interval so the heartbeat tests do not
+// have to sleep for real 10s ticks.
+func fastHeartbeat(t *testing.T) {
+	t.Helper()
+	previous := heartbeatInterval
+	heartbeatInterval = 20 * time.Millisecond
+	t.Cleanup(func() { heartbeatInterval = previous })
+}
+
 func TestSandboxURLWithBust(t *testing.T) {
 	s := &sandboxSession{URL: "https://prism.openai.com/s/sandboxes/proxy/", bust: "12345"}
 	got := s.urlWithBust("wait-for-sync")
 	want := "https://prism.openai.com/s/sandboxes/proxy/wait-for-sync?prism_cache_bust=12345"
 	if got != want {
 		t.Errorf("urlWithBust = %q, want %q", got, want)
+	}
+	// The heartbeat goes through the same helper, so the token-bearing path is
+	// what keeps the sandbox alive between turns.
+	if got := s.urlWithBust("heartbeat"); got != "https://prism.openai.com/s/sandboxes/proxy/heartbeat?prism_cache_bust=12345" {
+		t.Errorf("heartbeat url = %q", got)
+	}
+}
+
+// A cached sandbox is only usable while it is being kept alive: the web client
+// pings GET {sandbox}heartbeat every 10s and prism reclaims a sandbox that stops
+// answering. Without this the cache hands prism a dead sandbox and every turn
+// fails with an opaque "Error while processing conversation" (measured
+// 2026-09-17 — this is what made caching look slower than not caching).
+func TestSandboxHeartbeatIsSentWithTheToken(t *testing.T) {
+	fastHeartbeat(t)
+
+	// The handler runs on its own goroutine, so every field it touches is
+	// guarded; -race is what caught this the first time.
+	var mu sync.Mutex
+	beats, token := 0, ""
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/heartbeat" {
+			http.NotFound(w, r)
+			return
+		}
+		mu.Lock()
+		beats++
+		token = r.Header.Get("X-Crixet-Sandbox-Token")
+		mu.Unlock()
+		// Verbatim from the live endpoint: plain text, not JSON. Decoding it as
+		// JSON made every heartbeat look like a failure.
+		_, _ = w.Write([]byte(`OK`))
+	}))
+	defer server.Close()
+
+	client, err := newPrismClient(&storedAuth{Cookies: "c=1"})
+	if err != nil {
+		t.Fatalf("newPrismClient: %v", err)
+	}
+	session := &sandboxSession{
+		URL:   server.URL + "/",
+		Token: "sandbox-token-1",
+		bust:  "42",
+	}
+	client.keepAlive(session, "p-1")
+	t.Cleanup(func() { stopSandbox(session) })
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		mu.Lock()
+		seen := beats
+		mu.Unlock()
+		if seen >= 2 || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if beats < 2 {
+		t.Fatalf("heartbeat sent %d times, want at least 2", beats)
+	}
+	if token != "sandbox-token-1" {
+		t.Errorf("heartbeat token = %q, want the sandbox token", token)
+	}
+}
+
+// stopSandbox must end the heartbeat goroutine, or every dropped sandbox leaks
+// one for the life of the process.
+func TestStopSandboxEndsTheHeartbeat(t *testing.T) {
+	fastHeartbeat(t)
+
+	var beats int
+	var mu sync.Mutex
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		beats++
+		mu.Unlock()
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer server.Close()
+
+	client, err := newPrismClient(&storedAuth{Cookies: "c=1"})
+	if err != nil {
+		t.Fatalf("newPrismClient: %v", err)
+	}
+	session := &sandboxSession{URL: server.URL + "/", Token: "t", bust: "1"}
+	client.keepAlive(session, "p-1")
+	stopSandbox(session)
+
+	mu.Lock()
+	before := beats
+	mu.Unlock()
+	time.Sleep(300 * time.Millisecond)
+	mu.Lock()
+	after := beats
+	mu.Unlock()
+	if after != before {
+		t.Errorf("heartbeat kept running after stopSandbox (%d -> %d)", before, after)
 	}
 }
 
@@ -1349,6 +1458,53 @@ func TestCallbackCodeFromDevToolsPaste(t *testing.T) {
 			t.Errorf("%s: callbackCode = (%q, %v), want (%q, true)", c.name, got, ok, c.want)
 		}
 	}
+}
+
+// The config's user_id / project_uuid are documented as a way to skip the two
+// lookups that would otherwise run on every start. They only work if the client
+// actually reads them, which it did not: hydrate() kept calling /auth/session
+// and ensureProject() kept creating, so the knobs were inert. That matters more
+// than it sounds — /auth/session is a separate endpoint from the turn, and it
+// answered 504 while turns still worked (measured 2026-09-17).
+func TestClientFallsBackToConfigIDs(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.UserID = "user-from-config"
+	cfg.ProjectUUID = "project-from-config"
+	withConfig(t, cfg, func() {
+		client, err := newPrismClient(&storedAuth{Cookies: "c=1"})
+		if err != nil {
+			t.Fatalf("newPrismClient: %v", err)
+		}
+		if client.userID != "user-from-config" {
+			t.Errorf("userID = %q, want the configured one", client.userID)
+		}
+		if client.projectID != "project-from-config" {
+			t.Errorf("projectID = %q, want the configured one", client.projectID)
+		}
+	})
+}
+
+// A value in the credential still wins: it was learned from prism itself.
+func TestClientPrefersCredentialIDsOverConfig(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.UserID = "user-from-config"
+	cfg.ProjectUUID = "project-from-config"
+	withConfig(t, cfg, func() {
+		client, err := newPrismClient(&storedAuth{
+			Cookies:   "c=1",
+			UserID:    "user-from-credential",
+			ProjectID: "project-from-credential",
+		})
+		if err != nil {
+			t.Fatalf("newPrismClient: %v", err)
+		}
+		if client.userID != "user-from-credential" {
+			t.Errorf("userID = %q, want the credential's", client.userID)
+		}
+		if client.projectID != "project-from-credential" {
+			t.Errorf("projectID = %q, want the credential's", client.projectID)
+		}
+	})
 }
 
 // The host's callback box writes .oauth-<provider>-<state>.oauth containing
