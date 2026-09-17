@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -907,11 +908,10 @@ func TestPollLoginPendingThenSuccess(t *testing.T) {
 		t.Fatalf("fresh flow = (%q, %v), want pending", status, auth)
 	}
 	// The operator has to be told what to paste, and where.
-	// The popup closes itself, so the message has to steer the operator away
-	// from CPA's login button and tell them how to keep the code alive.
-	if !strings.Contains(message, callbackFileHint) || !strings.Contains(message, "F12") ||
-		!strings.Contains(message, "popup-callback") {
-		t.Errorf("pending message does not explain the capture steps: %q", message)
+	// Without a browser to drive, the fallback has to name the file the operator
+	// pastes into.
+	if !strings.Contains(message, callbackFileHint) {
+		t.Errorf("pending fallback does not name the paste target: %q", message)
 	}
 
 	// A mismatched state must not expose another flow's progress.
@@ -967,5 +967,67 @@ func TestCallbackCodeFromDevToolsPaste(t *testing.T) {
 		if !ok || got != c.want {
 			t.Errorf("%s: callbackCode = (%q, %v), want (%q, true)", c.name, got, ok, c.want)
 		}
+	}
+}
+
+// ------------------------------------------------------- browser sign-in
+
+func TestFreePortIsUsable(t *testing.T) {
+	port, err := freePort()
+	if err != nil {
+		t.Fatalf("freePort: %v", err)
+	}
+	if port <= 0 || port > 65535 {
+		t.Fatalf("freePort returned %d", port)
+	}
+	// The port must not be handed out twice in a row while still bound.
+	if again, err := freePort(); err == nil && again == port {
+		t.Error("freePort returned the same port twice")
+	}
+}
+
+func TestProxyServerArgument(t *testing.T) {
+	// NOTE: http.ProxyFromEnvironment caches the environment on first use, so a
+	// test cannot flip HTTPS_PROXY and observe the change. That caching is fine
+	// for the plugin (its environment does not change while running) but it rules
+	// out asserting the "no proxy configured" case here -- this only checks that
+	// whatever comes back is a usable --proxy-server value.
+	got := proxyServerArgument()
+	if got == "" {
+		return
+	}
+	parsed, err := url.Parse(got)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		t.Errorf("proxyServerArgument = %q, want empty or a scheme://host:port URL", got)
+	}
+	if strings.ContainsAny(got, " 	") {
+		t.Errorf("proxyServerArgument = %q, contains whitespace", got)
+	}
+}
+
+func TestFindBrowserReportsClearly(t *testing.T) {
+	t.Setenv("CPA_PRISM_BROWSER", filepath.Join(t.TempDir(), "does-not-exist.exe"))
+	path, err := findBrowser()
+	if err == nil {
+		// Fine when a real Chromium is installed elsewhere; just record it.
+		t.Logf("found browser: %s", path)
+		return
+	}
+	if !strings.Contains(err.Error(), "CPA_PRISM_BROWSER") {
+		t.Errorf("error should point at the override variable, got %v", err)
+	}
+}
+
+func TestBrowserProfileDirIsCreated(t *testing.T) {
+	dir, err := browserProfileDir()
+	if err != nil {
+		t.Fatalf("browserProfileDir: %v", err)
+	}
+	info, err := os.Stat(dir)
+	if err != nil || !info.IsDir() {
+		t.Fatalf("browserProfileDir did not create %q: %v", dir, err)
+	}
+	if !strings.Contains(dir, "cpa-prism-provider") {
+		t.Errorf("profile dir %q is not namespaced", dir)
 	}
 }

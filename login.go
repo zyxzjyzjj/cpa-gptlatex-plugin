@@ -46,6 +46,9 @@ type loginFlow struct {
 	prismState   string
 	client       *prismClient
 	created      time.Time
+	// browser is the window we opened for the operator. When present the flow
+	// completes by reading its cookie jar over CDP, not by asking for a paste.
+	browser *browserLogin
 
 	result *authData
 	failed string
@@ -133,7 +136,17 @@ func startLogin(ctx context.Context) (*loginFlow, error) {
 		created:      time.Now(),
 	}
 
+	// Open a window for the operator. If no Chromium browser is installed we
+	// still hand back the URL, and the paste path in auth.parse stays available
+	// as a fallback.
+	if browser, err := launchBrowserLogin(ctx, resp.Data.URL); err == nil {
+		flow.browser = browser
+	}
+
 	loginMu.Lock()
+	if previous := activeLogin; previous != nil && previous.browser != nil {
+		previous.browser.close()
+	}
 	activeLogin = flow
 	loginMu.Unlock()
 	return flow, nil
@@ -153,28 +166,56 @@ func newLoginState() string {
 // pollLogin reports progress for one flow.
 func pollLogin(state string) (status string, message string, authed *authData) {
 	loginMu.Lock()
-	defer loginMu.Unlock()
-
 	flow := activeLogin
-	if flow == nil || flow.state != state {
+	switch {
+	case flow == nil || flow.state != state:
+		loginMu.Unlock()
 		return "error", "找不到对应的登录流程，请重新点击登录", nil
-	}
-	if time.Since(flow.created) > loginFlowTTL {
+	case time.Since(flow.created) > loginFlowTTL:
+		if flow.browser != nil {
+			flow.browser.close()
+			flow.browser = nil
+		}
+		loginMu.Unlock()
 		return "error", "登录流程已超时，请重新点击登录", nil
+	case flow.failed != "":
+		message := flow.failed
+		loginMu.Unlock()
+		return "error", message, nil
+	case flow.result != nil:
+		result := flow.result
+		loginMu.Unlock()
+		return "success", "登录完成", result
 	}
-	if flow.failed != "" {
-		return "error", flow.failed, nil
+	browser := flow.browser
+	loginMu.Unlock()
+
+	// Reading the browser's cookie jar is a network round trip, so it happens
+	// with the lock released.
+	if browser != nil {
+		cookies, signedIn, err := browser.sessionCookieHeader(context.Background())
+		if err == nil && signedIn {
+			auth := &authData{
+				Provider:    providerName,
+				Label:       "prism (browser sign-in)",
+				Prefix:      "prism",
+				StorageJSON: (&storedAuth{Cookies: cookies}).encode(),
+			}
+			loginMu.Lock()
+			if activeLogin == flow {
+				flow.result = auth
+			}
+			loginMu.Unlock()
+			browser.close()
+			return "success", "登录完成", auth
+		}
+		return "pending", "已在浏览器窗口里打开 prism 的登录页，登录完成后这里会自动完成，不用复制任何东西。", nil
 	}
-	if flow.result != nil {
-		return "success", "登录完成", flow.result
-	}
+
 	return "pending", fmt.Sprintf(
-		"回调页是弹窗且会自关，所以【不要点 CPA 的登录按钮】——那样开的窗口一授权就消失，抓不到任何东西。"+
-			"请改成手动：1) 复制上面那个登录 URL；2) 新开一个浏览器标签页，先按 F12，Network 面板勾选 Preserve log，"+
-			"并在 Request blocking 里加一条 `popup-callback`；3) 把 URL 粘到地址栏回车、完成授权；"+
-			"4) 跳到回调时导航会被拦下，prism 的脚本不会执行，code 仍有效，地址栏里就是可复制的 callback URL；"+
-			"5) 把地址栏整条（或 Network 里右键 Copy as cURL）粘贴到 CPA 的 auth 目录下新建的 %s 文件。"+
-			"不用复制 cookie。",
+		"没有找到可用的 Chrome/Edge，无法自动读取登录结果。请手动完成：在浏览器里登录后，"+
+			"把回调 URL 粘贴到 CPA 的 auth 目录下新建的 %s 文件（Fiddler 里的 "+
+			"GET /auth/popup-callback?code=… 那条也可以整条粘贴）。",
 		callbackFileHint), nil
 }
 
