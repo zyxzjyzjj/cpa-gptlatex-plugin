@@ -1122,7 +1122,9 @@ func TestPanelServesFormAndReportsOutcome(t *testing.T) {
 	}
 
 	// A plain visit renders the form.
-	out, err := handlePanel([]byte(`{"Method":"GET"}`))
+	// The host reaches the panel through management.handle, so that is the entry
+	// point the test exercises.
+	out, err := handleManagementHandle([]byte(`{"Method":"GET","Path":"/panel"}`))
 	if err != nil {
 		t.Fatalf("GET: %v", err)
 	}

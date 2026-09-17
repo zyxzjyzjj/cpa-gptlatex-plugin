@@ -21,6 +21,9 @@ import (
 // JSON body or as query parameters, which makes it usable from a browser
 // address bar as well as from any HTTP client.
 
+// handleManagementHandle serves both the management route and the resource
+// panel: the host routes resource requests through management.handle as well.
+//
 // managementRoute is the registration entry for the host. Only the fields the
 // host reads are sent; the handler interface it carries on the Go side has no
 // meaning across the process boundary.
@@ -73,6 +76,12 @@ func handleManagementHandle(request []byte) ([]byte, error) {
 		if err := json.Unmarshal(request, &req); err != nil {
 			return managementReply(http.StatusBadRequest, "无法解析管理请求: "+err.Error())
 		}
+	}
+
+	// The host dispatches resource requests through this same method -- the
+	// panel is not a separate RPC -- so the path decides which surface ran.
+	if strings.HasSuffix(strings.TrimRight(req.Path, "/"), panelPath) {
+		return handlePanel(request)
 	}
 
 	source := "直接粘贴"
