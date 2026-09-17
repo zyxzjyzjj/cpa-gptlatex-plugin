@@ -46,16 +46,11 @@ type loginFlow struct {
 	prismState   string
 	client       *prismClient
 	created      time.Time
-	// browser is the window we opened for the operator. When present the flow
-	// completes by reading its cookie jar over CDP, not by asking for a paste.
-	browser *browserLogin
 
 	result *authData
 	failed string
-	// Progress-reporting bookkeeping: polling happens every few seconds, so the
-	// same condition must not be logged over and over.
-	loggedWaiting  bool
-	lastBrowserErr string
+	// Polling runs every few seconds, so the waiting notice is logged once.
+	loggedWaiting bool
 }
 
 var (
@@ -140,48 +135,7 @@ func startLogin(ctx context.Context) (*loginFlow, error) {
 		created:      time.Now(),
 	}
 
-	// Get a browser: one we start ourselves, or one the host already exposes on
-	// a debugging port. The second case is the only option when CPA runs in a
-	// container, because the plugin cannot launch the host's browser from inside.
-	if base := currentConfig().BrowserDebugURL; base != "" {
-		if browser, err := attachBrowser(ctx, base); err != nil {
-			loginLog("warn", "无法连接配置里的浏览器调试端点", map[string]any{"url": base, "error": err.Error()})
-		} else {
-			flow.browser = browser
-			if err := browser.openTab(ctx, resp.Data.URL); err != nil {
-				loginLog("warn", "已连接浏览器，但打开登录页失败", map[string]any{"error": err.Error()})
-			}
-			loginLog("info", "已接管浏览器，请在其中完成 prism 登录", map[string]any{"endpoint": base})
-		}
-	}
-
-	if flow.browser == nil {
-		browser, err := launchBrowserLogin(ctx, resp.Data.URL)
-		if err == nil {
-			flow.browser = browser
-			loginLog("info", "已打开浏览器窗口，请在窗口内完成 prism 登录", map[string]any{
-				"debug_port": browser.debugPort,
-				"profile":    browser.profile,
-			})
-		} else if remote, attachErr := attachBrowser(ctx, defaultRemoteBase); attachErr == nil {
-			flow.browser = remote
-			if err := remote.openTab(ctx, resp.Data.URL); err != nil {
-				loginLog("warn", "已连接浏览器，但打开登录页失败", map[string]any{"error": err.Error()})
-			}
-			loginLog("info", "已接管宿主机浏览器，请在其中完成 prism 登录", map[string]any{"endpoint": defaultRemoteBase})
-		} else {
-			loginLog("warn", "无法启动或连接浏览器，登录退回手动粘贴方式", map[string]any{
-				"launch_error": err.Error(),
-				"hint": "在宿主机上带 --remote-debugging-port=9222 启动一次 Chrome/Edge，" +
-					"并把 browser_debug_url 指向容器能访问到的地址（容器里通常是 http://host.docker.internal:9222）",
-			})
-		}
-	}
-
 	loginMu.Lock()
-	if previous := activeLogin; previous != nil && previous.browser != nil {
-		previous.browser.close()
-	}
 	activeLogin = flow
 	loginMu.Unlock()
 	return flow, nil
@@ -207,10 +161,6 @@ func pollLogin(state string) (status string, message string, authed *authData) {
 		loginMu.Unlock()
 		return "error", "找不到对应的登录流程，请重新点击登录", nil
 	case time.Since(flow.created) > loginFlowTTL:
-		if flow.browser != nil {
-			flow.browser.close()
-			flow.browser = nil
-		}
 		loginMu.Unlock()
 		return "error", "登录流程已超时，请重新点击登录", nil
 	case flow.failed != "":
@@ -222,55 +172,19 @@ func pollLogin(state string) (status string, message string, authed *authData) {
 		loginMu.Unlock()
 		return "success", "登录完成", result
 	}
-	browser := flow.browser
+	firstWait := !flow.loggedWaiting
+	flow.loggedWaiting = true
 	loginMu.Unlock()
 
-	// Reading the browser's cookie jar is a network round trip, so it happens
-	// with the lock released.
-	if browser != nil {
-		cookies, signedIn, err := browser.sessionCookieHeader(context.Background())
-		if err != nil {
-			loginMu.Lock()
-			first := flow.lastBrowserErr != err.Error()
-			flow.lastBrowserErr = err.Error()
-			loginMu.Unlock()
-			if first {
-				loginLog("warn", "读取浏览器 cookie 失败（会继续重试）", map[string]any{"error": err.Error()})
-			}
-			return "pending", "正在等待浏览器登录完成…", nil
-		}
-		if err == nil && signedIn {
-			auth := &authData{
-				Provider:    providerName,
-				Label:       "prism (browser sign-in)",
-				Prefix:      "prism",
-				StorageJSON: (&storedAuth{Cookies: cookies}).encode(),
-			}
-			loginMu.Lock()
-			if activeLogin == flow {
-				flow.result = auth
-			}
-			loginMu.Unlock()
-			browser.close()
-			loginLog("info", "登录完成，浏览器已关闭", map[string]any{
-				"cookies": len(strings.Split(cookies, ";")),
-			})
-			return "success", "登录完成", auth
-		}
-		loginMu.Lock()
-		firstWait := !flow.loggedWaiting
-		flow.loggedWaiting = true
-		loginMu.Unlock()
-		if firstWait {
-			loginLog("info", "浏览器已就绪，等待你完成登录", nil)
-		}
-		return "pending", "已在浏览器窗口里打开 prism 的登录页，登录完成后这里会自动完成，不用复制任何东西。", nil
+	if firstWait {
+		loginLog("info", "等待回调：请完成 prism 登录，并把回调 URL 粘贴进来", map[string]any{
+			"file": callbackFileHint,
+		})
 	}
-
 	return "pending", fmt.Sprintf(
-		"没有找到可用的 Chrome/Edge，无法自动读取登录结果。请手动完成：在浏览器里登录后，"+
-			"把回调 URL 粘贴到 CPA 的 auth 目录下新建的 %s 文件（Fiddler 里的 "+
-			"GET /auth/popup-callback?code=… 那条也可以整条粘贴）。",
+		"在浏览器里完成 prism 登录后，把回调 URL 粘贴到 CPA 的 auth 目录下新建的 %s 文件即可。"+
+			"回调页会自动关闭，所以从 Fiddler 里取那条 GET /auth/popup-callback?code=… 的地址最方便"+
+			"（整条粘过来，或者右键 Copy as cURL 也行）。不用复制 cookie。",
 		callbackFileHint), nil
 }
 
@@ -444,4 +358,15 @@ func handleLoginPoll(request []byte) ([]byte, error) {
 		resp["Auth"] = *authed
 	}
 	return okEnvelope(resp)
+}
+
+// loginLog reports sign-in progress through the host logger, so it appears in
+// CPA's own output instead of a file to go find. Values that are credentials --
+// cookies, the state, the authorize URL -- are never included.
+func loginLog(level, message string, fields map[string]any) {
+	if fields == nil {
+		fields = map[string]any{}
+	}
+	fields["component"] = "login"
+	hostLog(level, message, fields)
 }

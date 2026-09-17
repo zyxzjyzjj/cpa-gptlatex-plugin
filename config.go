@@ -23,11 +23,6 @@ type config struct {
 	// **这不是可选项**：实测（2026-09-17）不提供 sandbox_url 时服务端只会一直
 	// 返回 sandbox_reconnecting，整轮永远不会成功，因此默认开启。
 	EnableSandbox bool
-	// BrowserDebugURL points at a Chromium debugging endpoint the plugin did not
-	// start itself. Needed when CPA runs in a container: the plugin cannot launch
-	// the host's browser, but it can reach a debug port the host exposes
-	// (host.docker.internal:9222 by default).
-	BrowserDebugURL string
 }
 
 func defaultConfig() config {
@@ -100,9 +95,6 @@ func configure(raw []byte) error {
 	}
 	if v, ok := flat["sandbox"].(bool); ok {
 		next.EnableSandbox = v
-	}
-	if v, ok := flat["browser_debug_url"].(string); ok {
-		next.BrowserDebugURL = strings.TrimSpace(v)
 	}
 	if models, ok := parseModels(flat["models"]); ok {
 		next.Models = models
