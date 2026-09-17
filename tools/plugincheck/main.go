@@ -290,8 +290,8 @@ func runProtocolChecks(cli *client) {
 	cfgYAML := []byte(`cookies: "prism_session_token=SESSION; prism_oai_access_token=ACCESS"
 user_id: user-test123
 project_title: PluginCheck
-models: ["gpt-6-astra", "gpt-5-codex"]
-default_model: gpt-6-astra
+models: ["gpt-5.6-sol", "gpt-5.6-terra"]
+default_model: gpt-5.6-sol
 reasoning_effort: high
 sandbox: true
 system_prompt: "You are a test."
@@ -493,7 +493,7 @@ system_prompt: "You are a test."
 				pr.Auth.Prefix != "" &&
 					!strings.HasSuffix(pr.Auth.Prefix, "/") &&
 					!strings.HasSuffix(pr.Auth.Prefix, "-"),
-				"prefix=%q composes as %q", pr.Auth.Prefix, pr.Auth.Prefix+"/gpt-6-astra")
+				"prefix=%q composes as %q", pr.Auth.Prefix, pr.Auth.Prefix+"/gpt-5.6-sol")
 		}
 	}
 
@@ -513,7 +513,7 @@ system_prompt: "You are a test."
 
 	// ---- executor.count_tokens -------------------------------------------
 	fmt.Println("executor.count_tokens")
-	env, rc, err = cli.call("executor.count_tokens", []byte(`{"Model":"gpt-6-astra","Format":"chat-completions"}`))
+	env, rc, err = cli.call("executor.count_tokens", []byte(`{"Model":"gpt-5.6-sol","Format":"chat-completions"}`))
 	var er struct {
 		Payload []byte `json:"Payload"`
 	}

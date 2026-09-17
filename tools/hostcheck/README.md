@@ -49,11 +49,11 @@ pluginhost: plugin registered plugin_id=prism-provider plugin_name=prism-provide
 
 ```
 auth file changed (CREATE): prism-test.json, processing incrementally
-Registered new model gpt-6-astra from provider prism-provider
+Registered new model gpt-5.6-sol from provider prism-provider
 Registered client prism-test.json from provider prism-provider with 2 models
 ```
 
-`GET /v1/models` 返回 `gpt-6-astra` 与宿主按 `Prefix` 拼出的别名 `prism/gpt-6-astra`。
+`GET /v1/models` 返回上游下发的 `gpt-5.6-sol`（写这份记录时）与宿主按 `Prefix` 拼出的别名 `prism/gpt-5.6-sol`。
 
 带**占位 cookie** 打一发真实对话，走通了 `executor.execute` 全链路直到上游：
 
