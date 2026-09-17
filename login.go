@@ -169,9 +169,11 @@ func pollLogin(state string) (status string, message string, authed *authData) {
 		return "success", "登录完成", flow.result
 	}
 	return "pending", fmt.Sprintf(
-		"浏览器里登录完成后，把地址栏里的 %s/auth/popup-callback?code=... 整条 URL "+
-			"粘贴到 CPA 的 auth 目录下新建的 %s 里即可完成（不用复制 cookie）",
-		baseURL, callbackFileHint), nil
+		"登录页回调是弹窗，换完会话它会自己关闭，地址栏来不及复制。请先按 F12 打开开发者工具，"+
+			"在 Network 面板勾选 Preserve log，再点登录；完成后在列表里找到 popup-callback 那条请求，"+
+			"右键 → Copy as cURL（或 Copy link address），把内容整段粘贴到 CPA 的 auth 目录下新建的 %s 文件即可。"+
+			"不用复制 cookie，也不用管地址栏。",
+		callbackFileHint), nil
 }
 
 // pendingLogin returns the current flow, if any, so a pasted callback URL can be
@@ -185,12 +187,17 @@ func pendingLogin() *loginFlow {
 	return activeLogin
 }
 
-// callbackCode extracts the authorization code from pasted text, accepting
-// either a full callback URL or a bare "code=..." fragment.
+// callbackCode extracts the authorization code from pasted text.
 //
-// The bare form is deliberately narrow: requiring it to *start* with "code="
-// keeps an ordinary cookie header (which routinely contains "code=" inside some
-// unrelated value) from being mistaken for a callback.
+// prism's callback page is a popup: it redeems the code and closes itself, so
+// the operator usually cannot copy the bare URL out of the address bar. The URL
+// therefore tends to arrive embedded in something else -- a DevTools
+// "Copy as cURL", a request line, a header dump -- so the first thing this does
+// is scan for a callback URL anywhere in the text.
+//
+// The bare "code=" form stays deliberately narrow: requiring the text to *start*
+// with it keeps an ordinary cookie header (which routinely contains "code="
+// inside some unrelated value) from being mistaken for a callback.
 func callbackCode(text string) (string, bool) {
 	// Copied values often arrive wrapped in quotes, angle brackets or markdown
 	// punctuation; strip that framing before looking at the content.
@@ -199,13 +206,20 @@ func callbackCode(text string) (string, bool) {
 		return "", false
 	}
 
-	if strings.Contains(trimmed, "://") {
-		parsed, err := url.Parse(trimmed)
-		if err != nil || !strings.Contains(parsed.Path, "popup-callback") {
-			return "", false
+	// Find the URL token inside arbitrary surrounding text. The delimiters cover
+	// the shapes people actually paste: quotes from a cURL command, and the
+	// brackets of a markdown link.
+	if i := strings.Index(trimmed, "://"); i >= 0 {
+		start := strings.LastIndexAny(trimmed[:i], " \t\r\n\"'([<") + 1
+		candidate := trimmed[start:]
+		if end := strings.IndexAny(candidate, " \t\r\n\"')]>,"); end >= 0 {
+			candidate = candidate[:end]
 		}
-		code := parsed.Query().Get("code")
-		return code, code != ""
+		if parsed, err := url.Parse(candidate); err == nil && strings.Contains(parsed.Path, "popup-callback") {
+			if code := parsed.Query().Get("code"); code != "" {
+				return code, true
+			}
+		}
 	}
 
 	rest, ok := strings.CutPrefix(trimmed, "code=")

@@ -933,3 +933,36 @@ func TestPollLoginPendingThenSuccess(t *testing.T) {
 		t.Error("pendingLogin returned an expired flow")
 	}
 }
+
+// The callback page closes itself, so the operator cannot copy the address bar.
+// Whatever DevTools hands them -- a cURL line, a request line, a header dump --
+// has to be parseable.
+func TestCallbackCodeFromDevToolsPaste(t *testing.T) {
+	const urlPart = "https://prism.openai.com/auth/popup-callback?code=ac_CMD123&state=prism_openai_oauth_state.v1.abc"
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"copy as curl, multiple headers", "curl '" + urlPart + "' -H 'accept: */*' -H 'cookie: x=y'", "ac_CMD123"},
+		{"curl with double quotes", `curl "` + urlPart + `" --compressed`, "ac_CMD123"},
+		{"request line", "GET " + urlPart + " HTTP/2", "ac_CMD123"},
+		{"hAR style json", `"url": "` + urlPart + `",`, "ac_CMD123"},
+		{"markdown link", "[here](" + urlPart + ")", "ac_CMD123"},
+		{"bare url still works", urlPart, "ac_CMD123"},
+		{"url with no code", "curl 'https://prism.openai.com/auth/popup-callback?state=x'", ""},
+		{"unrelated url in text", "curl 'https://prism.openai.com/api/llm/response_with_tools_start?code=zzz'", ""},
+	}
+	for _, c := range cases {
+		got, ok := callbackCode(c.in)
+		if c.want == "" {
+			if ok {
+				t.Errorf("%s: callbackCode = (%q, true), want no match", c.name, got)
+			}
+			continue
+		}
+		if !ok || got != c.want {
+			t.Errorf("%s: callbackCode = (%q, %v), want (%q, true)", c.name, got, ok, c.want)
+		}
+	}
+}
