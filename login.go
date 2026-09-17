@@ -245,18 +245,24 @@ func callbackCode(text string) (string, bool) {
 	return rest, rest != ""
 }
 
-// completeLogin finishes the flow from pasted callback text.
-func completeLogin(ctx context.Context, pasted string) (*authData, error) {
+// credentialFileName is the auth file the credential lands in. A stable name
+// means signing in again replaces the same file instead of piling up copies.
+const credentialFileName = "prism-provider.json"
+
+// completeLogin finishes the flow from pasted callback text. persist asks the
+// plugin to write the credential itself, which the panel path needs because it
+// has no return value for the host to persist.
+func completeLogin(ctx context.Context, pasted string, persist bool) (*authData, error) {
 	code, ok := callbackCode(pasted)
 	if !ok {
 		return nil, fmt.Errorf("这不是一个 prism 回调 URL")
 	}
-	return completeLoginWithState(ctx, code, "")
+	return completeLoginWithState(ctx, code, "", persist)
 }
 
 // completeLoginWithState redeems an authorization code. stateOverride comes from
 // the host's callback box; the flow's own state is used when it is empty.
-func completeLoginWithState(ctx context.Context, code, stateOverride string) (*authData, error) {
+func completeLoginWithState(ctx context.Context, code, stateOverride string, persist bool) (*authData, error) {
 	code = strings.TrimSpace(code)
 	if code == "" {
 		return nil, fmt.Errorf("回调里没有 code")
@@ -302,18 +308,25 @@ func completeLoginWithState(ctx context.Context, code, stateOverride string) (*a
 		loginLog("error", "回调被接受但没有返回会话 cookie", nil)
 		return nil, fmt.Errorf("回调被接受但没有拿到会话 cookie，请重试一次")
 	}
-	loginLog("info", "会话已建立，登录完成", nil)
-
 	// The session is enough on its own; hydrate() fills in the user id from
 	// /auth/session on first use.
 	auth := &authData{
 		Provider: providerName,
 		Label:    "prism (browser sign-in)",
 		Prefix:   "prism",
+		FileName: credentialFileName,
 		// The whole jar travels with the credential: it carries
 		// prism_session_token plus the OpenAI tokens prism set alongside it.
 		StorageJSON: (&storedAuth{Cookies: header}).encode(),
 	}
+	if persist {
+		if err := saveHostAuth(auth); err != nil {
+			loginLog("error", "会话已建立，但凭据保存失败", map[string]any{"error": err.Error()})
+			return nil, err
+		}
+	}
+	loginLog("info", "会话已建立，登录完成", nil)
+
 	loginMu.Lock()
 	if activeLogin == flow {
 		activeLogin.result = auth

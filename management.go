@@ -102,7 +102,7 @@ func handleManagementHandle(request []byte) ([]byte, error) {
 	}
 
 	loginLog("info", "收到管理接口提交的回调", map[string]any{"source": source})
-	_, err := completeLogin(context.Background(), pasted)
+	_, err := completeLogin(context.Background(), pasted, true)
 	if err != nil {
 		loginLog("error", "管理接口提交的回调未能完成登录", map[string]any{"error": err.Error()})
 		return managementReply(http.StatusBadRequest, err.Error())
@@ -242,7 +242,7 @@ func handlePanel(request []byte) ([]byte, error) {
 	}
 
 	loginLog("info", "面板收到回调", nil)
-	if _, err := completeLogin(context.Background(), pasted); err != nil {
+	if _, err := completeLogin(context.Background(), pasted, true); err != nil {
 		loginLog("error", "面板提交的回调未能完成登录", map[string]any{"error": err.Error()})
 		return htmlReply(http.StatusOK, panelHTML(pasted, err.Error(), true)), nil
 	}

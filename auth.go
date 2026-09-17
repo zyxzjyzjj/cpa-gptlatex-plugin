@@ -75,7 +75,7 @@ func handleParseAuth(request []byte) ([]byte, error) {
 		State string `json:"state"`
 	}
 	if err := json.Unmarshal(req.RawJSON, &callback); err == nil && strings.TrimSpace(callback.Code) != "" {
-		auth, err := completeLoginWithState(context.Background(), callback.Code, callback.State)
+		auth, err := completeLoginWithState(context.Background(), callback.Code, callback.State, false)
 		if err != nil {
 			return errorEnvelope("authentication_error", err.Error(), http.StatusBadRequest), nil
 		}
@@ -83,7 +83,7 @@ func handleParseAuth(request []byte) ([]byte, error) {
 	}
 	if !json.Valid(req.RawJSON) {
 		if _, isCallback := callbackCode(string(req.RawJSON)); isCallback {
-			auth, err := completeLogin(context.Background(), string(req.RawJSON))
+			auth, err := completeLogin(context.Background(), string(req.RawJSON), false)
 			if err != nil {
 				return errorEnvelope("authentication_error", err.Error(), http.StatusBadRequest), nil
 			}

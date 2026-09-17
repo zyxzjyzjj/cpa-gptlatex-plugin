@@ -131,6 +131,9 @@ const (
 	methodManagementResource = "management.resource"
 
 	methodHostLog = "host.log"
+	// Ask the host to persist a credential. Needed on the panel path, which has
+	// no auth.parse return value to hand it back through.
+	methodHostAuthSave = "host.auth.save"
 )
 
 var (
@@ -533,4 +536,72 @@ func errorEnvelope(code, message string, httpStatus int) []byte {
 		Error: &envelopeError{Code: code, Message: message, HTTPStatus: httpStatus},
 	})
 	return raw
+}
+
+// callHostJSON invokes a host callback and decodes its envelope result into out.
+// callHost above is fire-and-forget; this one is for calls whose answer matters.
+func callHostJSON(method string, payload []byte, out any) error {
+	cMethod := C.CString(method)
+	defer C.free(unsafe.Pointer(cMethod))
+
+	var response C.cliproxy_buffer
+	var req *C.uint8_t
+	if len(payload) > 0 {
+		req = (*C.uint8_t)(C.CBytes(payload))
+		defer C.free(unsafe.Pointer(req))
+	}
+	if C.call_host_api(cMethod, req, C.size_t(len(payload)), &response) != 0 {
+		return fmt.Errorf("宿主回调 %s 调用失败", method)
+	}
+	if response.ptr == nil || response.len == 0 {
+		return fmt.Errorf("宿主回调 %s 没有返回内容", method)
+	}
+	raw := C.GoBytes(response.ptr, C.int(response.len))
+	C.free_host_buffer(response.ptr, response.len)
+
+	var envelope struct {
+		OK     bool            `json:"ok"`
+		Result json.RawMessage `json:"result"`
+		Error  *struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(raw, &envelope); err != nil {
+		return fmt.Errorf("解析宿主回调响应失败: %w", err)
+	}
+	if !envelope.OK {
+		if envelope.Error != nil && envelope.Error.Message != "" {
+			return fmt.Errorf("%s", envelope.Error.Message)
+		}
+		return fmt.Errorf("宿主回调 %s 返回错误", method)
+	}
+	if out == nil || len(envelope.Result) == 0 {
+		return nil
+	}
+	return json.Unmarshal(envelope.Result, out)
+}
+
+// saveHostAuth has the host write the credential to its auth directory. Without
+// this the panel path completes a sign-in and leaves nothing behind: only the
+// auth.parse path returns an AuthData for the host to persist itself.
+func saveHostAuth(auth *authData) error {
+	if auth == nil || len(auth.StorageJSON) == 0 {
+		return fmt.Errorf("凭据为空")
+	}
+	payload, err := json.Marshal(map[string]any{
+		"name": credentialFileName,
+		"json": json.RawMessage(auth.StorageJSON),
+	})
+	if err != nil {
+		return err
+	}
+	var saved struct {
+		Name string `json:"name"`
+		Path string `json:"path"`
+	}
+	if err := callHostJSON(methodHostAuthSave, payload, &saved); err != nil {
+		return fmt.Errorf("保存凭据失败: %w", err)
+	}
+	loginLog("info", "凭据已写入 CPA", map[string]any{"name": saved.Name, "path": saved.Path})
+	return nil
 }
