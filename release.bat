@@ -3,11 +3,13 @@ setlocal EnableExtensions DisableDelayedExpansion
 
 rem Publish this repository and trigger .github/workflows/release.yml.
 rem
-rem Usage:
-rem   release.bat
-rem   release.bat 0.1.1
-rem   release.bat 0.1.1 --yes
-rem   release.bat 0.1.1 --dry-run
+rem Arguments are positional, the same shape the reference plugin uses:
+rem   release.bat [version] [--yes|--dry-run]
+rem
+rem The version defaults to the one compiled into main.go, and a version whose
+rem tag already exists (locally or on origin) is rejected below -- so every
+rem release has to be given a new number, and the metadata in main.go,
+rem registry.json and registry-entry.json is synchronized to it.
 
 cd /d "%~dp0"
 
@@ -51,7 +53,7 @@ if /i "%VERSION:~0,1%"=="v" set "VERSION=%VERSION:~1%"
 
 echo %VERSION%| findstr /R /X "[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*" >nul
 if errorlevel 1 (
-  echo ERROR: Version must use dotted numeric form, for example 0.1.1.
+  echo ERROR: Version must use dotted numeric form, for example 0.1.2.
   goto :abort_release
 )
 
