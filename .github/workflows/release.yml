@@ -54,7 +54,7 @@ jobs:
           fi
           version="${RELEASE_TAG#v}"
           source_version="$(sed -n 's/^var version = "\([^"]*\)"/\1/p' main.go)"
-          registry_version="$(grep -A3 '"id": "prism-provider"' registry.json | sed -n 's/.*"version": "\([^"]*\)".*/\1/p' | head -1)"
+          registry_version="$(python -c 'import json,sys; d=json.load(open("registry.json")); print(next((p.get("version","") for p in d.get("plugins",[]) if p.get("id")==sys.argv[1]),""))' "$PLUGIN_ID")"
           for item in "source:$source_version" "registry:$registry_version"; do
             if [ "${item#*:}" != "$version" ]; then
               echo "version mismatch ($item, tag:$version)" >&2
