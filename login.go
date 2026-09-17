@@ -245,12 +245,21 @@ func callbackCode(text string) (string, bool) {
 	return rest, rest != ""
 }
 
-// completeLogin finishes the flow from a pasted callback URL and returns the
-// credential the host should store.
+// completeLogin finishes the flow from pasted callback text.
 func completeLogin(ctx context.Context, pasted string) (*authData, error) {
 	code, ok := callbackCode(pasted)
 	if !ok {
 		return nil, fmt.Errorf("这不是一个 prism 回调 URL")
+	}
+	return completeLoginWithState(ctx, code, "")
+}
+
+// completeLoginWithState redeems an authorization code. stateOverride comes from
+// the host's callback box; the flow's own state is used when it is empty.
+func completeLoginWithState(ctx context.Context, code, stateOverride string) (*authData, error) {
+	code = strings.TrimSpace(code)
+	if code == "" {
+		return nil, fmt.Errorf("回调里没有 code")
 	}
 	flow := pendingLogin()
 	if flow == nil {
@@ -262,11 +271,18 @@ func completeLogin(ctx context.Context, pasted string) (*authData, error) {
 		Error string `json:"error"`
 	}
 	loginLog("info", "收到回调，正在用它换取会话", map[string]any{"code_length": len(code)})
+	state := flow.prismState
+	if override := strings.TrimSpace(stateOverride); override != "" {
+		if override != state {
+			loginLog("warn", "回调里的 state 与本流程不一致，按回调里的值提交", nil)
+		}
+		state = override
+	}
 	if err := flow.client.do(ctx, http.MethodPost, "/api/auth/popup-callback", map[string]any{
 		"code":     code,
 		"legacy":   false,
 		"provider": "openai",
-		"state":    flow.prismState,
+		"state":    state,
 	}, &ack); err != nil {
 		loginLog("error", "提交回调失败", map[string]any{"error": err.Error()})
 		return nil, fmt.Errorf("提交回调失败: %w", err)

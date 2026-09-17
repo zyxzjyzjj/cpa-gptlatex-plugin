@@ -62,10 +62,25 @@ func handleParseAuth(request []byte) ([]byte, error) {
 	if err := json.Unmarshal(request, &req); err != nil {
 		return nil, fmt.Errorf("decode auth.parse: %w", err)
 	}
-	// A pasted OAuth callback URL completes a pending sign-in. This is the
-	// operator's half of the login flow, so a plain paste is enough — no JSON
-	// wrapper and no cookie copying. Non-JSON content only, so an ordinary
-	// credential file can never be mistaken for one.
+	// Sign-in completion arrives here by two routes, both of which end up as a
+	// file in the auth directory:
+	//
+	//  1. The host's own callback box ("paste the redirect URL"): it validates the
+	//     state against the session auth.login.start created and writes
+	//     {"code":…,"state":…} as .oauth-<provider>-<state>.oauth.
+	//  2. The operator pasting the callback URL straight into a file, which may
+	//     be any plain text (a bare URL, a "Copy as cURL" line, a HAR fragment).
+	var callback struct {
+		Code  string `json:"code"`
+		State string `json:"state"`
+	}
+	if err := json.Unmarshal(req.RawJSON, &callback); err == nil && strings.TrimSpace(callback.Code) != "" {
+		auth, err := completeLoginWithState(context.Background(), callback.Code, callback.State)
+		if err != nil {
+			return errorEnvelope("authentication_error", err.Error(), http.StatusBadRequest), nil
+		}
+		return okEnvelope(authParseResponse{Handled: true, Auth: auth})
+	}
 	if !json.Valid(req.RawJSON) {
 		if _, isCallback := callbackCode(string(req.RawJSON)); isCallback {
 			auth, err := completeLogin(context.Background(), string(req.RawJSON))

@@ -968,3 +968,40 @@ func TestCallbackCodeFromDevToolsPaste(t *testing.T) {
 		}
 	}
 }
+
+// The host's callback box writes .oauth-<provider>-<state>.oauth containing
+// {"code":…,"state":…} and hands it to auth.parse. It must be recognised as a
+// sign-in completion, not shrugged off as an unknown credential file. With no
+// flow in flight the completion fails, but the error must be about the flow --
+// that is what proves the file was routed down the callback path.
+func TestParseAuthAcceptsHostCallbackFile(t *testing.T) {
+	loginMu.Lock()
+	previous := activeLogin
+	activeLogin = nil
+	loginMu.Unlock()
+	defer func() { loginMu.Lock(); activeLogin = previous; loginMu.Unlock() }()
+
+	payload := base64.StdEncoding.EncodeToString([]byte(
+		`{"code":"ac_TESTCODE","state":"prism_openai_oauth_state.v1.abc.def"}`))
+	request := []byte(`{"Provider":"prism-provider","FileName":".oauth-prism-provider-x.oauth","RawJSON":"` + payload + `"}`)
+
+	out, err := handleParseAuth(request)
+	if err != nil {
+		t.Fatalf("handleParseAuth returned a Go error: %v", err)
+	}
+	var env struct {
+		OK    bool `json:"ok"`
+		Error *struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(out, &env); err != nil {
+		t.Fatalf("envelope decode: %v", err)
+	}
+	if env.OK {
+		t.Fatal("a callback with no flow in flight should not report success")
+	}
+	if env.Error == nil || !strings.Contains(env.Error.Message, "登录流程") {
+		t.Fatalf("message = %+v, want it to be about the pending flow", env.Error)
+	}
+}
