@@ -485,6 +485,7 @@ func reg() registration {
 				{Name: "models", Type: "array", Description: "可用模型，单行 JSON 数组"},
 				{Name: "default_model", Type: "string", Description: "客户端未指定模型时使用的模型"},
 				{Name: "reasoning_effort", Type: "enum", EnumValues: []string{"low", "medium", "high", "xhigh"}, Description: "思考档位"},
+				{Name: "browser_debug_url", Type: "string", Description: "已在运行的 Chromium 调试端点（如 http://host.docker.internal:9222）；容器里跑 CPA 时必填，否则插件无法启动浏览器"},
 				{Name: "sandbox", Type: "boolean", Description: "领取 LaTeX 沙箱并完成工作区同步（默认开；关掉则服务端只会返回 sandbox_reconnecting，拿不到答案）"},
 				{Name: "system_prompt", Type: "string", Description: "覆盖默认 system prompt"},
 			},

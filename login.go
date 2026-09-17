@@ -140,17 +140,42 @@ func startLogin(ctx context.Context) (*loginFlow, error) {
 		created:      time.Now(),
 	}
 
-	// Open a window for the operator. If no Chromium browser is installed we
-	// still hand back the URL, and the paste path in auth.parse stays available
-	// as a fallback.
-	if browser, err := launchBrowserLogin(ctx, resp.Data.URL); err != nil {
-		loginLog("warn", "无法启动浏览器，登录将退回手动粘贴方式", map[string]any{"error": err.Error()})
-	} else {
-		flow.browser = browser
-		loginLog("info", "已打开浏览器窗口，请在窗口内完成 prism 登录", map[string]any{
-			"debug_port": browser.debugPort,
-			"profile":    browser.profile,
-		})
+	// Get a browser: one we start ourselves, or one the host already exposes on
+	// a debugging port. The second case is the only option when CPA runs in a
+	// container, because the plugin cannot launch the host's browser from inside.
+	if base := currentConfig().BrowserDebugURL; base != "" {
+		if browser, err := attachBrowser(ctx, base); err != nil {
+			loginLog("warn", "无法连接配置里的浏览器调试端点", map[string]any{"url": base, "error": err.Error()})
+		} else {
+			flow.browser = browser
+			if err := browser.openTab(ctx, resp.Data.URL); err != nil {
+				loginLog("warn", "已连接浏览器，但打开登录页失败", map[string]any{"error": err.Error()})
+			}
+			loginLog("info", "已接管浏览器，请在其中完成 prism 登录", map[string]any{"endpoint": base})
+		}
+	}
+
+	if flow.browser == nil {
+		browser, err := launchBrowserLogin(ctx, resp.Data.URL)
+		if err == nil {
+			flow.browser = browser
+			loginLog("info", "已打开浏览器窗口，请在窗口内完成 prism 登录", map[string]any{
+				"debug_port": browser.debugPort,
+				"profile":    browser.profile,
+			})
+		} else if remote, attachErr := attachBrowser(ctx, defaultRemoteBase); attachErr == nil {
+			flow.browser = remote
+			if err := remote.openTab(ctx, resp.Data.URL); err != nil {
+				loginLog("warn", "已连接浏览器，但打开登录页失败", map[string]any{"error": err.Error()})
+			}
+			loginLog("info", "已接管宿主机浏览器，请在其中完成 prism 登录", map[string]any{"endpoint": defaultRemoteBase})
+		} else {
+			loginLog("warn", "无法启动或连接浏览器，登录退回手动粘贴方式", map[string]any{
+				"launch_error": err.Error(),
+				"hint": "在宿主机上带 --remote-debugging-port=9222 启动一次 Chrome/Edge，" +
+					"并把 browser_debug_url 指向容器能访问到的地址（容器里通常是 http://host.docker.internal:9222）",
+			})
+		}
 	}
 
 	loginMu.Lock()

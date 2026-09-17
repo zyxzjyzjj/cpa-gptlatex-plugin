@@ -38,6 +38,9 @@ type browserLogin struct {
 	profile   string
 	cmd       *exec.Cmd
 	started   time.Time
+	// remoteBase is set when we attached to a browser somebody else started
+	// (the container case). There is then no process of ours to kill.
+	remoteBase string
 }
 
 // findBrowser locates a Chromium browser we can drive.
@@ -149,7 +152,7 @@ func proxyServerArgument() string {
 
 // close terminates the browser we launched (and only that one).
 func (b *browserLogin) close() {
-	if b == nil || b.cmd == nil || b.cmd.Process == nil {
+	if b == nil || b.remoteBase != "" || b.cmd == nil || b.cmd.Process == nil {
 		return
 	}
 	_ = b.cmd.Process.Kill()
@@ -247,10 +250,18 @@ func (b *browserLogin) cookies(ctx context.Context) ([]cdpCookie, error) {
 	return nil, fmt.Errorf("浏览器调试端口无响应")
 }
 
+// base returns the HTTP root of the debugging endpoint.
+func (b *browserLogin) base() string {
+	if b.remoteBase != "" {
+		return strings.TrimSuffix(b.remoteBase, "/")
+	}
+	return fmt.Sprintf("http://127.0.0.1:%d", b.debugPort)
+}
+
 // debuggerURL reads the browser's WebSocket endpoint for the browser target.
 func (b *browserLogin) debuggerURL(ctx context.Context) (string, error) {
 	client := &http.Client{Timeout: 5 * time.Second}
-	endpoint := fmt.Sprintf("http://127.0.0.1:%d/json/version", b.debugPort)
+	endpoint := b.base() + "/json/version"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return "", err
@@ -285,4 +296,41 @@ func loginLog(level, message string, fields map[string]any) {
 	}
 	fields["component"] = "login"
 	hostLog(level, message, fields)
+}
+
+// attachBrowser attaches to a debugging endpoint that is already listening --
+// a browser the host started, which is the only option when CPA runs in a
+// container and cannot launch the host's browser itself.
+func attachBrowser(ctx context.Context, base string) (*browserLogin, error) {
+	candidate := &browserLogin{remoteBase: strings.TrimSuffix(base, "/")}
+	if _, err := candidate.debuggerURL(ctx); err != nil {
+		return nil, err
+	}
+	return candidate, nil
+}
+
+// defaultRemoteBase is where a container reaches its host's debug port.
+const defaultRemoteBase = "http://host.docker.internal:9222"
+
+// openTab asks the attached browser for a new tab at url.
+func (b *browserLogin) openTab(ctx context.Context, url string) error {
+	wsURL, err := b.debuggerURL(ctx)
+	if err != nil {
+		return err
+	}
+	dialer := websocket.Dialer{HandshakeTimeout: 10 * time.Second}
+	dialer.Proxy = nil
+	conn, _, err := dialer.DialContext(ctx, wsURL, nil)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	if err := conn.WriteJSON(map[string]any{
+		"id":     1,
+		"method": "Target.createTarget",
+		"params": map[string]any{"url": url},
+	}); err != nil {
+		return err
+	}
+	return nil
 }
