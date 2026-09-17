@@ -202,7 +202,7 @@ func panelHTML(redirectURL, message string, failed bool) []byte {
 <h1>Prism 登录</h1>
 <p class="sub">把浏览器地址栏里的回调 URL 粘进来即可完成登录。</p>
 ` + notice + `
-<form method="post">
+<form method="get">
  <label for="redirect_url">回调 URL</label>
  <textarea id="redirect_url" name="redirect_url" placeholder="https://prism.openai.com/auth/popup-callback?code=…&amp;state=…" autofocus>` + escaped + `</textarea>
  <button type="submit">完成登录</button>
@@ -238,13 +238,13 @@ func handlePanel(request []byte) ([]byte, error) {
 		return htmlReply(http.StatusOK, panelHTML("", "", false)), nil
 	}
 	if pasted == "" {
-		return htmlReply(http.StatusBadRequest, panelHTML("", "没有收到回调 URL，请粘贴后再提交。", true)), nil
+		return htmlReply(http.StatusOK, panelHTML("", "没有收到回调 URL，请粘贴后再提交。", true)), nil
 	}
 
 	loginLog("info", "面板收到回调", nil)
 	if _, err := completeLogin(context.Background(), pasted); err != nil {
 		loginLog("error", "面板提交的回调未能完成登录", map[string]any{"error": err.Error()})
-		return htmlReply(http.StatusBadRequest, panelHTML(pasted, err.Error(), true)), nil
+		return htmlReply(http.StatusOK, panelHTML(pasted, err.Error(), true)), nil
 	}
 	loginLog("info", "登录完成（面板提交）", nil)
 	return htmlReply(http.StatusOK, panelHTML("", "登录完成，凭据已写入 prism-provider。", false)), nil

@@ -1141,14 +1141,16 @@ func TestPanelServesFormAndReportsOutcome(t *testing.T) {
 		t.Fatalf("POST: %v", err)
 	}
 	status, page = decode(t, out)
-	if status != 400 || !strings.Contains(page, "登录流程") {
+	// The outcome is rendered in the page with a 200; the host turns a plugin 4xx
+	// into a bare 502 and drops the body, which would hide the reason.
+	if status != 200 || !strings.Contains(page, "登录流程") {
 		t.Fatalf("POST panel = %d, want a 400 about the pending flow: %s", status, page)
 	}
 
 	// Submitting nothing explains what is missing instead of failing silently.
 	out, _ = handlePanel([]byte(`{"Method":"POST","Body":""}`))
 	status, page = decode(t, out)
-	if status != 400 || !strings.Contains(page, "粘贴") {
+	if status != 200 || !strings.Contains(page, "粘贴") {
 		t.Fatalf("empty POST panel = %d, want guidance: %s", status, page)
 	}
 }
