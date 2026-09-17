@@ -128,6 +128,7 @@ const (
 
 	methodManagementRegister = "management.register"
 	methodManagementHandle   = "management.handle"
+	methodManagementResource = "management.resource"
 
 	methodHostLog = "host.log"
 )
@@ -469,6 +470,8 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 		return handleManagementRegister()
 	case methodManagementHandle:
 		return handleManagementHandle(request)
+	case methodManagementResource:
+		return handlePanel(request)
 	default:
 		// Unknown methods are reported as a failed call rather than a Go error
 		// so the host surfaces a clean envelope instead of a transport fault.

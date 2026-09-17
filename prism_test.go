@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -1096,5 +1097,56 @@ func TestManagementHandleAcceptsBothShapes(t *testing.T) {
 	}
 	if !strings.Contains(string(emptyEnv.Result.Body), "redirect_url") {
 		t.Errorf("empty request should say what to send: %s", emptyEnv.Result.Body)
+	}
+}
+
+func TestPanelServesFormAndReportsOutcome(t *testing.T) {
+	loginMu.Lock()
+	previous := activeLogin
+	activeLogin = nil
+	loginMu.Unlock()
+	defer func() { loginMu.Lock(); activeLogin = previous; loginMu.Unlock() }()
+
+	decode := func(t *testing.T, out []byte) (int, string) {
+		t.Helper()
+		var env struct {
+			Result struct {
+				StatusCode int    `json:"StatusCode"`
+				Body       []byte `json:"Body"`
+			} `json:"result"`
+		}
+		if err := json.Unmarshal(out, &env); err != nil {
+			t.Fatalf("envelope decode: %v", err)
+		}
+		return env.Result.StatusCode, string(env.Result.Body)
+	}
+
+	// A plain visit renders the form.
+	out, err := handlePanel([]byte(`{"Method":"GET"}`))
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	status, page := decode(t, out)
+	if status != 200 || !strings.Contains(page, "redirect_url") || !strings.Contains(page, "完成登录") {
+		t.Fatalf("GET panel = %d, page missing the form: %s", status, page[:min(200, len(page))])
+	}
+
+	// A form submission reaches the completion path; with no flow in flight the
+	// error has to be about the flow, which proves the paste was parsed.
+	body := []byte("redirect_url=" + url.QueryEscape("https://prism.openai.com/auth/popup-callback?code=ac_PANEL&state=prism_openai_oauth_state.v1.x.y"))
+	out, err = handlePanel([]byte(`{"Method":"POST","Body":"` + base64.StdEncoding.EncodeToString(body) + `","Headers":{"Content-Type":["application/x-www-form-urlencoded"]}}`))
+	if err != nil {
+		t.Fatalf("POST: %v", err)
+	}
+	status, page = decode(t, out)
+	if status != 400 || !strings.Contains(page, "登录流程") {
+		t.Fatalf("POST panel = %d, want a 400 about the pending flow: %s", status, page)
+	}
+
+	// Submitting nothing explains what is missing instead of failing silently.
+	out, _ = handlePanel([]byte(`{"Method":"POST","Body":""}`))
+	status, page = decode(t, out)
+	if status != 400 || !strings.Contains(page, "粘贴") {
+		t.Fatalf("empty POST panel = %d, want guidance: %s", status, page)
 	}
 }
