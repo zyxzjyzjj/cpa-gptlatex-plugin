@@ -54,8 +54,13 @@ jobs:
           fi
           version="${RELEASE_TAG#v}"
           source_version="$(sed -n 's/^var version = "\([^"]*\)"/\1/p' main.go)"
-          registry_version="$(grep -A3 '"id": "prism-provider"' registry.json | sed -n 's/.*"version": "\([^"]*\)".*/\1/p' | head -1)"
-          for item in "source:$source_version" "registry:$registry_version"; do
+          # jq, not grep: in registry.json the version field does not sit
+          # adjacent to the id, so a line-window match silently returns an empty
+          # string and the comparison below fails with "version mismatch
+          # (registry:)".
+          registry_version="$(jq -r '.plugins[] | select(.id == "prism-provider") | .version' registry.json)"
+          entry_version="$(jq -r '.version' registry-entry.json)"
+          for item in "source:$source_version" "registry:$registry_version" "entry:$entry_version"; do
             if [ "${item#*:}" != "$version" ]; then
               echo "version mismatch ($item, tag:$version)" >&2
               exit 1
@@ -68,7 +73,7 @@ jobs:
       - name: Install C toolchains and archive tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends gcc gcc-mingw-w64-x86-64 binutils zip unzip
+          sudo apt-get install -y --no-install-recommends gcc gcc-mingw-w64-x86-64 binutils jq zip unzip
 
       - name: Test
         run: |
