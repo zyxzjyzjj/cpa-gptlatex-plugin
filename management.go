@@ -200,7 +200,8 @@ func panelHTML(redirectURL, message string, failed bool) []byte {
  ol{color:#555;padding-left:20px}
 </style></head><body><main>
 <h1>Prism 登录</h1>
-<p class="sub">把浏览器地址栏里的回调 URL 粘进来即可完成登录。</p>
+<p class="sub"><a href="?action=start" style="font-weight:600">① 开始登录</a>
+ &nbsp;→&nbsp; ② 登录完成后把回调 URL 粘在下面 &nbsp;→&nbsp; ③ 完成登录</p>
 ` + notice + `
 <form method="get">
  <label for="redirect_url">回调 URL</label>
@@ -232,6 +233,18 @@ func handlePanel(request []byte) ([]byte, error) {
 	pasted := strings.TrimSpace(firstQueryValue(req.Query, "redirect_url", "url", "callback"))
 	if pasted == "" {
 		pasted = strings.TrimSpace(formField(req.Body, req.Headers, "redirect_url"))
+	}
+
+	// One page for the whole sign-in: starting the authorization happens here too,
+	// so the operator never has to go find the login URL first.
+	if action := strings.TrimSpace(firstQueryValue(req.Query, "action")); strings.EqualFold(action, "start") {
+		flow, err := startLogin(context.Background())
+		if err != nil {
+			loginLog("error", "面板无法开始登录", map[string]any{"error": err.Error()})
+			return htmlReply(http.StatusOK, panelHTML("", "无法开始登录: "+err.Error(), true)), nil
+		}
+		loginLog("info", "面板发起了登录", nil)
+		return htmlReply(http.StatusOK, redirectHTML(flow.authorizeURL)), nil
 	}
 
 	if req.Method == http.MethodGet && pasted == "" {
@@ -280,4 +293,20 @@ func htmlReply(status int, page []byte) []byte {
 		return errorEnvelope("internal_error", err.Error(), http.StatusInternalServerError)
 	}
 	return envelope
+}
+
+// redirectHTML bounces the browser to the authorization URL. A meta refresh is
+// used rather than a 302 so the response shape stays a plain page, which is what
+// the resource bridge is for, and so it works with scripting unavailable.
+func redirectHTML(target string) []byte {
+	escaped := strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;", `"`, "&quot;").Replace(target)
+	return []byte(`<!DOCTYPE html>
+<html lang="zh"><head><meta charset="utf-8">
+<meta http-equiv="refresh" content="0;url=` + escaped + `">
+<title>正在前往 prism 登录…</title>
+<style>body{font:15px/1.6 system-ui,"Segoe UI",sans-serif;padding:28px}
+a{color:#1f1f1f}</style></head><body>
+<p>正在前往 prism 的登录页…如果没有自动跳转，<a href="` + escaped + `">点这里</a>。</p>
+<p>登录完成后回到本页，把回调 URL 粘进来即可。</p>
+</body></html>`)
 }
