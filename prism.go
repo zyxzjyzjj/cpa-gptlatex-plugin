@@ -782,6 +782,11 @@ func (c *prismClient) keepAlive(session *sandboxSession, projectID string) {
 	go func() {
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
+		// The endpoint blocks for seconds and occasionally exceeds the timeout
+		// on its own (measured 2026-09-17: one 25s deadline while the sandbox was
+		// fine). Dropping the session on a single miss threw away a healthy
+		// sandbox and paid the handshake again, so only consecutive failures do.
+		failures := 0
 		for {
 			select {
 			case <-ctx.Done():
@@ -795,11 +800,16 @@ func (c *prismClient) keepAlive(session *sandboxSession, projectID string) {
 				session.urlWithBust("heartbeat"), session.Token, nil, nil)
 			reqCancel()
 			if err == nil {
+				failures = 0
 				continue
 			}
-			// A dead sandbox is not an error to report here: the next turn
-			// either reconnects or fails with a message the operator can act on.
-			hostLog("warn", "prism 沙箱心跳失败，丢弃缓存 error="+err.Error(), nil)
+			failures++
+			hostLog("warn", fmt.Sprintf("prism 沙箱心跳失败 连续=%d error=%s", failures, err), nil)
+			if failures < heartbeatFailuresBeforeDrop {
+				continue
+			}
+			// The sandbox is gone; the next turn re-provisions. Not reported as
+			// an error: it is a normal part of the sandbox lifecycle.
 			dropSandbox(projectID)
 			return
 		}
@@ -835,6 +845,11 @@ var heartbeatInterval = 10 * time.Second
 
 // heartbeatTimeout matches the client's 25s abort for this call.
 const heartbeatTimeout = 25 * time.Second
+
+// heartbeatFailuresBeforeDrop is how many heartbeats in a row must fail before
+// the sandbox is considered gone. One timeout is not evidence: the endpoint is
+// slow by design and occasionally overshoots its own deadline.
+const heartbeatFailuresBeforeDrop = 2
 
 // waitForSyncBudget bounds how long we wait for the workspace to report synced.
 const waitForSyncBudget = 60 * time.Second
