@@ -39,10 +39,10 @@ func rememberProjectID(sa *storedAuth, projectID string) {
 	}
 	if err := saveHostAuth(auth); err != nil {
 		// Losing this only costs a lookup next start; the turn itself is fine.
-		hostLog("warn", "把项目 ID 写回凭据失败", map[string]any{"error": err.Error()})
+		hostLog("warn", "把项目 ID 写回凭据失败 error="+err.Error(), nil)
 		return
 	}
-	hostLog("info", "项目 ID 已写回凭据", map[string]any{"project": projectID})
+	hostLog("info", "项目 ID 已写回凭据 project="+projectID, nil)
 }
 
 // importFile is the shape accepted by `auth.parse` — a hand-written JSON file

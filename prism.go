@@ -160,9 +160,7 @@ func (c *prismClient) catalogFor(ctx context.Context) (*modelCatalog, error) {
 	catalog, err := c.fetchCatalog(refreshCtx)
 	if err != nil {
 		if cached != nil {
-			hostLog("warn", "刷新 prism 模型清单失败，沿用上一次结果", map[string]any{
-				"error": err.Error(),
-			})
+			hostLog("warn", "刷新 prism 模型清单失败，沿用上一次结果 error="+err.Error(), nil)
 			return cached, nil
 		}
 		return nil, err
@@ -174,9 +172,8 @@ func (c *prismClient) catalogFor(ctx context.Context) (*modelCatalog, error) {
 	for _, m := range catalog.Models {
 		ids = append(ids, m.ID)
 	}
-	hostLog("info", "已获取 prism 模型清单", map[string]any{
-		"models": strings.Join(ids, ","), "free_model": catalog.FreeModel,
-	})
+	hostLog("info", fmt.Sprintf("已获取 prism 模型清单 models=%s free_model=%s",
+		strings.Join(ids, ","), catalog.FreeModel), nil)
 	return catalog, nil
 }
 
@@ -356,14 +353,14 @@ func (c *prismClient) ensureProject(ctx context.Context) (string, error) {
 		// A turn needs *a* project, not a fresh one — nothing in a turn depends
 		// on the workspace contents — so an existing project is a fine fallback
 		// when creation is refused.
-		hostLog("warn", "创建 prism 项目失败，改用已有项目", map[string]any{"error": err.Error()})
+		hostLog("warn", "创建 prism 项目失败，改用已有项目 error="+err.Error(), nil)
 		// Any project will do here: the turn needs a workspace id, not this
 		// plugin's own workspace, so an unrelated project beats failing.
 		fallback, fallbackErr := c.findOwnProject(ctx, "")
 		if fallbackErr != nil || fallback == "" {
 			return "", fmt.Errorf("创建 prism 项目失败: %w", err)
 		}
-		hostLog("info", "复用账户里已有的 prism 项目", map[string]any{"project": fallback})
+		hostLog("info", "复用账户里已有的 prism 项目 project="+fallback, nil)
 		c.setProject(fallback)
 		return c.projectID, nil
 	}
@@ -432,10 +429,7 @@ func terminalTurnError(resp *turnResponse) *prismError {
 		if message == "" {
 			message = "prism 返回 " + resp.Status
 		}
-		hostLog("error", "prism 回合终止", map[string]any{
-			"status":  resp.Status,
-			"message": message,
-		})
+		hostLog("error", fmt.Sprintf("prism 回合终止 status=%s message=%s", resp.Status, message), nil)
 		return &prismError{Status: status, Reason: resp.Status, Message: message}
 	}
 	return nil
@@ -534,11 +528,8 @@ func (c *prismClient) startTurn(ctx context.Context, body turnRequest) (*turnRes
 	if pe := terminalTurnError(&out); pe != nil {
 		return nil, pe
 	}
-	hostLog("info", "prism 回合已提交", map[string]any{
-		"status":         out.Status,
-		"request_id":     out.RequestID,
-		"has_turn_state": len(out.TurnState) > 0,
-	})
+	hostLog("info", fmt.Sprintf("prism 回合已提交 status=%s request_id=%s turn_state=%t",
+		out.Status, out.RequestID, len(out.TurnState) > 0), nil)
 	if strings.TrimSpace(out.RequestID) == "" {
 		return nil, fmt.Errorf("response_with_tools_start 未返回 request_id")
 	}
@@ -582,7 +573,7 @@ func (c *prismClient) runTurn(ctx context.Context, req turnRequest, poll time.Du
 			return nil, err
 		}
 		lastErr = err
-		hostLog("warn", "prism 要求重连沙箱，重新领取后重试", map[string]any{"attempt": attempt + 1})
+		hostLog("warn", fmt.Sprintf("prism 要求重连沙箱，重新领取后重试 attempt=%d", attempt+1), nil)
 		if onRetry != nil {
 			onRetry()
 		}
@@ -635,17 +626,15 @@ func interpret(res *turnResult) (*turnPayload, error) {
 		return &res.Payload, nil
 	}
 	if sameReason(res.Payload.Reason, reasonSandboxReconnecting) {
-		hostLog("warn", "prism 沙箱重连中，本轮将重试", map[string]any{
-			"reason":  res.Payload.Reason,
-			"message": res.Payload.Message,
-		})
+		hostLog("warn", fmt.Sprintf("prism 沙箱重连中，本轮将重试 reason=%s message=%s",
+			res.Payload.Reason, res.Payload.Message), nil)
 		return nil, errSandboxReconnecting
 	}
 	msg := res.Payload.Message
 	if msg == "" {
 		msg = res.Payload.Reason
 	}
-	hostLog("error", "prism 本轮失败", turnErrorFields(&res.Payload))
+	hostLog("error", "prism 本轮失败 "+turnErrorDetail(&res.Payload), nil)
 	return nil, &prismError{
 		Status:     res.Payload.HTTPStatus,
 		Reason:     res.Payload.Reason,
@@ -655,28 +644,40 @@ func interpret(res *turnResult) (*turnPayload, error) {
 	}
 }
 
-// turnErrorFields renders prism's failure payload for the host log. `reason`
+// turnErrorDetail renders prism's failure payload for the host log. `reason`
 // and `messageKey` name the condition; codexRequestDebug is the server's own
 // account of the turn (the sandbox URL it resolved, the exec endpoint it
 // called, whether it saw a sandbox token at all), which is what separates a
 // rejected model name from a sandbox that never arrived.
-func turnErrorFields(p *turnPayload) map[string]any {
-	fields := map[string]any{
-		"reason":       p.Reason,
-		"message":      p.Message,
-		"message_key":  p.MessageKey,
-		"root_cause":   p.RootCause,
-		"http_status":  p.HTTPStatus,
-		"conversation": p.ConversationID,
+//
+// It returns one string rather than a field map because the host renders only a
+// fixed set of field names (model, error, reason…) and silently drops the rest,
+// so anything not in that set has to travel inside the message.
+func turnErrorDetail(p *turnPayload) string {
+	parts := []string{
+		"reason=" + p.Reason,
+		"message=" + p.Message,
+	}
+	if p.MessageKey != "" {
+		parts = append(parts, "messageKey="+p.MessageKey)
+	}
+	if p.RootCause != "" {
+		parts = append(parts, "rootCause="+p.RootCause)
+	}
+	if p.HTTPStatus != 0 {
+		parts = append(parts, fmt.Sprintf("httpStatus=%d", p.HTTPStatus))
+	}
+	if p.ConversationID != "" {
+		parts = append(parts, "conversation="+p.ConversationID)
 	}
 	if len(p.CodexRequestDebug) > 0 {
 		debug := string(p.CodexRequestDebug)
 		if len(debug) > 1500 {
 			debug = debug[:1500] + "…"
 		}
-		fields["codex_request_debug"] = debug
+		parts = append(parts, "codexRequestDebug="+debug)
 	}
-	return fields
+	return strings.Join(parts, " ")
 }
 
 var errSandboxReconnecting = fmt.Errorf("sandbox reconnecting")
@@ -746,10 +747,6 @@ type sandboxSession struct {
 	// yjs holds the provider socket open. It must outlive the turn: dropping it
 	// puts the sandbox back into "syncing".
 	yjs *yjsSession
-	// provisioned records whether this session was built now (false when it came
-	// from the cache), which is what tells a slow first request from a slow
-	// upstream.
-	provisioned bool
 
 	expires time.Time
 }
@@ -785,12 +782,14 @@ var (
 )
 
 // ensureSandbox returns a ready sandbox for the project, provisioning and
-// syncing a new one when the cached entry is missing or stale.
-func (c *prismClient) ensureSandbox(ctx context.Context, projectID string) (*sandboxSession, error) {
+// syncing a new one when the cached entry is missing or stale. `reused` says
+// whether the cached one was used, which is what tells a slow first request
+// (the handshake) apart from a slow upstream turn.
+func (c *prismClient) ensureSandbox(ctx context.Context, projectID string) (*sandboxSession, bool, error) {
 	sandboxMu.Lock()
 	if cached, ok := sandboxCache[projectID]; ok && time.Now().Before(cached.expires) {
 		sandboxMu.Unlock()
-		return cached, nil
+		return cached, true, nil
 	}
 	stale := sandboxCache[projectID]
 	delete(sandboxCache, projectID)
@@ -801,13 +800,13 @@ func (c *prismClient) ensureSandbox(ctx context.Context, projectID string) (*san
 
 	session, err := c.provisionSandbox(ctx, projectID)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
 	sandboxMu.Lock()
 	sandboxCache[projectID] = session
 	sandboxMu.Unlock()
-	return session, nil
+	return session, false, nil
 }
 
 // provisionSandbox runs the whole pre-turn handshake.
@@ -822,7 +821,7 @@ func (c *prismClient) provisionSandbox(ctx context.Context, projectID string) (*
 	if created.URL == "" || created.Token == "" {
 		return nil, fmt.Errorf("领取 prism 沙箱返回缺少 url/token")
 	}
-	session := &sandboxSession{URL: created.URL, Token: created.Token, bust: newCacheBust(), provisioned: true}
+	session := &sandboxSession{URL: created.URL, Token: created.Token, bust: newCacheBust()}
 	if !strings.HasSuffix(session.URL, "/") {
 		session.URL += "/"
 	}

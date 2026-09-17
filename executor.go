@@ -51,13 +51,8 @@ func handleExecute(raw []byte, stream bool) ([]byte, error) {
 	// The host log is the only place an operator can see which model prism was
 	// actually asked for; the client-facing error cannot say it.
 	started := time.Now()
-	hostLog("info", "开始 prism 回合", map[string]any{
-		"model":         model,
-		"messages":      len(chat.Messages),
-		"input_items":   len(input),
-		"stream":        stream,
-		"request_model": req.Model,
-	})
+	hostLog("info", fmt.Sprintf("开始 prism 回合 model=%s 消息=%d 输入项=%d stream=%t 请求模型=%s",
+		model, len(chat.Messages), len(input), stream, req.Model), map[string]any{"model": model})
 
 	projectID, err := client.ensureProject(ctx)
 	if err != nil {
@@ -80,23 +75,20 @@ func handleExecute(raw []byte, stream bool) ([]byte, error) {
 	// 实测 metadata.sandbox_url 用公开地址即可，服务端在 turn_state 里会换成内部集群地址。
 	attachSandbox := func() error {
 		mark := time.Now()
-		sb, sbErr := client.ensureSandbox(ctx, projectID)
+		sb, reused, sbErr := client.ensureSandbox(ctx, projectID)
 		if sbErr != nil {
-			hostLog("error", "prism 沙箱领取失败", map[string]any{
-				"project":    projectID,
-				"error":      sbErr.Error(),
-				"elapsed_ms": time.Since(started).Milliseconds(),
-			})
+			hostLog("error", fmt.Sprintf("prism 沙箱领取失败 已耗时=%dms", time.Since(started).Milliseconds()),
+				map[string]any{"error": sbErr.Error()})
 			return sbErr
 		}
 		metadata["sandbox_url"] = sb.URL
 		metadata["sandbox_token"] = sb.Token
-		sandboxMS += time.Since(mark).Milliseconds()
-		hostLog("info", "prism 沙箱就绪", map[string]any{
-			"project":    projectID,
-			"cached":     !sb.provisioned,
-			"elapsed_ms": time.Since(started).Milliseconds(),
-		})
+		took := time.Since(mark).Milliseconds()
+		sandboxMS += took
+		// The host renders only known field names, so the numbers go in the
+		// message; 复用=true means no handshake was paid this time.
+		hostLog("info", fmt.Sprintf("prism 沙箱就绪 复用=%t 本次=%dms 累计=%dms",
+			reused, took, sandboxMS), nil)
 		return nil
 	}
 	if cfg.EnableSandbox {
@@ -119,19 +111,20 @@ func handleExecute(raw []byte, stream bool) ([]byte, error) {
 		}
 	})
 	if err != nil {
-		fields := map[string]any{
-			"model":      model,
-			"project":    projectID,
-			"elapsed_ms": time.Since(started).Milliseconds(),
-			"error":      err.Error(),
-		}
+		total := time.Since(started).Milliseconds()
+		// Only `model`/`reason`/`error` survive the host's field filter, so the
+		// model name, the phase timings and prism's own reason/messageKey all go
+		// into the message.
+		detail := fmt.Sprintf("prism 回合失败 model=%s 沙箱=%dms 回合=%dms 合计=%dms",
+			model, sandboxMS, total-sandboxMS, total)
 		if pErr, ok := err.(*prismError); ok {
-			fields["reason"] = pErr.Reason
-			fields["message_key"] = pErr.MessageKey
-			fields["root_cause"] = pErr.RootCause
-			fields["upstream_status"] = pErr.Status
+			detail += fmt.Sprintf(" reason=%s messageKey=%s rootCause=%s upstreamStatus=%d",
+				pErr.Reason, pErr.MessageKey, pErr.RootCause, pErr.Status)
 		}
-		hostLog("error", "prism 回合失败", fields)
+		hostLog("error", detail+" error="+err.Error(), map[string]any{
+			"model": model,
+			"error": err.Error(),
+		})
 
 		// 传输层/沙箱类失败（而非服务端明确返回的业务错误）说明缓存的沙箱不可用，
 		// 丢掉它，下次请求重新领取。
@@ -151,14 +144,13 @@ func handleExecute(raw []byte, stream bool) ([]byte, error) {
 		text = "（prism 未返回可显示的文本）"
 	}
 
-	hostLog("info", "prism 回合完成", map[string]any{
-		"model":       model,
-		"project":     projectID,
-		"response_id": payload.ID,
-		"chars":       len(text),
-		"sandbox_ms":  sandboxMS,
-		"turn_ms":     time.Since(started).Milliseconds() - sandboxMS,
-		"elapsed_ms":  time.Since(started).Milliseconds(),
+	// The host only renders a fixed set of field names (model, error, reason…),
+	// so anything an operator needs to see has to be in the message itself —
+	// fields such as elapsed_ms are dropped on the way to the log file.
+	total := time.Since(started).Milliseconds()
+	hostLog("info", fmt.Sprintf("prism 回合完成 model=%s 沙箱=%dms 回合=%dms 合计=%dms 字数=%d",
+		model, sandboxMS, total-sandboxMS, total, len(text)), map[string]any{
+		"model": model,
 	})
 
 	// Framing follows the RPC method, not the client's "stream" flag: the host
