@@ -747,7 +747,19 @@ func (c *prismClient) doRequest(ctx context.Context, method, target string, body
 		if resp.Header.Get("x-prism-auth-error") == "missing-openai-token" {
 			return fmt.Errorf("prism 缺少 OpenAI access token cookie，请重新登录后更新 cookie")
 		}
-		return fmt.Errorf("prism 会话已失效 (401)，请更新 cookie")
+		// prism reports several distinct failures as 401, and the body says which
+		// one; dropping it produced a misleading "session expired" for all of them.
+		detail := strings.TrimSpace(string(raw))
+		if len(detail) > 300 {
+			detail = detail[:300]
+		}
+		if detail == "" {
+			detail = resp.Header.Get("x-prism-auth-error")
+		}
+		if detail == "" {
+			detail = "响应体为空"
+		}
+		return fmt.Errorf("prism %s 返回 401: %s", target, detail)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		// Cloudflare answers a flagged client with an HTML block page. The
