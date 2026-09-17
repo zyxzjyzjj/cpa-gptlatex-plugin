@@ -169,10 +169,12 @@ func pollLogin(state string) (status string, message string, authed *authData) {
 		return "success", "登录完成", flow.result
 	}
 	return "pending", fmt.Sprintf(
-		"登录页回调是弹窗，换完会话它会自己关闭，地址栏来不及复制。请先按 F12 打开开发者工具，"+
-			"在 Network 面板勾选 Preserve log，再点登录；完成后在列表里找到 popup-callback 那条请求，"+
-			"右键 → Copy as cURL（或 Copy link address），把内容整段粘贴到 CPA 的 auth 目录下新建的 %s 文件即可。"+
-			"不用复制 cookie，也不用管地址栏。",
+		"回调页是弹窗且会自关，所以【不要点 CPA 的登录按钮】——那样开的窗口一授权就消失，抓不到任何东西。"+
+			"请改成手动：1) 复制上面那个登录 URL；2) 新开一个浏览器标签页，先按 F12，Network 面板勾选 Preserve log，"+
+			"并在 Request blocking 里加一条 `popup-callback`；3) 把 URL 粘到地址栏回车、完成授权；"+
+			"4) 跳到回调时导航会被拦下，prism 的脚本不会执行，code 仍有效，地址栏里就是可复制的 callback URL；"+
+			"5) 把地址栏整条（或 Network 里右键 Copy as cURL）粘贴到 CPA 的 auth 目录下新建的 %s 文件。"+
+			"不用复制 cookie。",
 		callbackFileHint), nil
 }
 

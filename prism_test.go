@@ -907,8 +907,11 @@ func TestPollLoginPendingThenSuccess(t *testing.T) {
 		t.Fatalf("fresh flow = (%q, %v), want pending", status, auth)
 	}
 	// The operator has to be told what to paste, and where.
-	if !strings.Contains(message, "popup-callback") || !strings.Contains(message, callbackFileHint) {
-		t.Errorf("pending message does not explain the paste step: %q", message)
+	// The popup closes itself, so the message has to steer the operator away
+	// from CPA's login button and tell them how to keep the code alive.
+	if !strings.Contains(message, callbackFileHint) || !strings.Contains(message, "F12") ||
+		!strings.Contains(message, "popup-callback") {
+		t.Errorf("pending message does not explain the capture steps: %q", message)
 	}
 
 	// A mismatched state must not expose another flow's progress.
