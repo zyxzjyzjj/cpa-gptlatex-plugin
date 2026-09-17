@@ -19,7 +19,10 @@
 一次请求的完整流程：
 
 1. 用你提供的 **cookie** 调 `GET /auth/session`，取到 `openai_user_id`（形如 `user-…`）。
-2. 若还没有项目，`POST /api/projects` 创建一个（`project_uuid` 由客户端生成）。
+2. 选一个项目：凭据/配置里指定过就用它，否则复用本插件此前创建的（标题匹配 `project_title`，
+   列表里最新那个），都没有才 `POST /api/projects` 新建（`project_uuid` 由客户端生成）。
+   复用是必要的：缓存只在内存里，重启后就没了——2026-09-17 实测如此攒下了 14 个项目；
+   而且 prism 在项目存储不可用时会用 503 拒掉**新建**，读取却正常，复用它就能照常工作。
 3. 把 `messages` 转成 Prism 的 Responses 风格 `input` 数组。
 4. `POST /api/llm/response_with_tools_start`，body 为
    `{input, previousResponseId, metadata:{projectId, userId, model, reasoning_effort, frontend_origin}, conversationId}`。
@@ -182,6 +185,8 @@ plugins:
 
 > `models` 三种写法都认：单行 JSON 数组字符串（CPA 文档的写法）、真正的 YAML 列表、以及带 `id` 字段的对象数组。
 
+> **模型清单是上游下发的，`models` 留空即可**；填了才覆盖（见上）。
+>
 > **首次跑通建议：把 `user_id` 和 `project_uuid` 都填上。** 两个都非空时会短路掉两次多余往返——`metadata.userId` 直接用你给的值（不再调 `GET /auth/session`），项目直接用你给的 UUID（不再调 `POST /api/projects`）。既省一次往返，也让你明确复用浏览器里已有的那个项目。
 >
 > 这两个端点本身**已经和抓包核对过**：`POST /api/projects` 的请求体/响应体逐字段一致（见 [`docs/prism-protocol.md`](docs/prism-protocol.md) §4.1 与 A6），`GET /auth/session` 的字段名也实测确认（同上）。

@@ -32,8 +32,10 @@ func newUUID() string {
 	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }
 
+// baseURL is a var so tests can point the client at a local server.
+var baseURL = "https://prism.openai.com"
+
 const (
-	baseURL       = "https://prism.openai.com"
 	maxInputBytes = 1_800_000 // 前端在 18e5 字节处截断 input
 	userAgent     = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
 		"(KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36 Edg/152.0.0.0"
@@ -324,6 +326,16 @@ func (c *prismClient) ensureProject(ctx context.Context) (string, error) {
 		return cached, nil
 	}
 
+	// Reuse a project this plugin created earlier rather than minting another
+	// one on every restart: the cache above is in memory, so without this each
+	// CPA restart left another workspace behind (14 had piled up by 2026-09-17).
+	if id, err := c.findOwnProject(ctx, cfg.ProjectTitle); err == nil && id != "" {
+		hostLog("info", "复用已有的 prism 项目", map[string]any{"project": id})
+		c.projectID = id
+		rememberProject(c.credKey, id)
+		return id, nil
+	}
+
 	id := newUUID()
 	body := map[string]any{
 		"project_uuid": id,
@@ -334,7 +346,18 @@ func (c *prismClient) ensureProject(ctx context.Context) (string, error) {
 		UUID string `json:"uuid"`
 	}
 	if err := c.do(ctx, http.MethodPost, "/api/projects", body, &resp); err != nil {
-		return "", fmt.Errorf("创建 prism 项目失败: %w", err)
+		// Prism answers 503 "Project storage is temporarily unavailable" on
+		// creation while reads keep working, and a turn needs *a* project, not
+		// a fresh one — nothing in a turn depends on the workspace contents.
+		hostLog("warn", "创建 prism 项目失败，改用已有项目", map[string]any{"error": err.Error()})
+		fallback, fallbackErr := c.findOwnProject(ctx, "")
+		if fallbackErr != nil || fallback == "" {
+			return "", fmt.Errorf("创建 prism 项目失败: %w", err)
+		}
+		hostLog("info", "复用账户里已有的 prism 项目", map[string]any{"project": fallback})
+		c.projectID = fallback
+		rememberProject(c.credKey, fallback)
+		return fallback, nil
 	}
 	if resp.UUID == "" {
 		resp.UUID = id
@@ -342,6 +365,31 @@ func (c *prismClient) ensureProject(ctx context.Context) (string, error) {
 	c.projectID = resp.UUID
 	rememberProject(c.credKey, resp.UUID)
 	return c.projectID, nil
+}
+
+// findOwnProject returns the newest existing project, preferring one whose
+// title matches what this plugin creates. An empty title accepts any project.
+func (c *prismClient) findOwnProject(ctx context.Context, title string) (string, error) {
+	var out struct {
+		Projects []struct {
+			UUID    string `json:"uuid"`
+			Title   string `json:"title"`
+			Deleted bool   `json:"deleted"`
+		} `json:"projects"`
+	}
+	if err := c.do(ctx, http.MethodGet, "/api/file-management/projects?section=your_projects", nil, &out); err != nil {
+		return "", err
+	}
+	// The list arrives newest first, so the first match is the most recent one.
+	for _, p := range out.Projects {
+		if p.Deleted || p.UUID == "" {
+			continue
+		}
+		if title == "" || p.Title == title {
+			return p.UUID, nil
+		}
+	}
+	return "", fmt.Errorf("账户里没有可复用的 prism 项目")
 }
 
 // ------------------------------------------------------------- turns

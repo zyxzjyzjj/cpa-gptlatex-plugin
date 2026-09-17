@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -229,6 +230,30 @@ func TestBuildInputRejectsOversizedHistory(t *testing.T) {
 	})
 }
 
+// withBaseURL points the client at a local server for the duration of a test.
+func withBaseURL(t *testing.T, url string) {
+	t.Helper()
+	previous := baseURL
+	baseURL = url
+	t.Cleanup(func() { baseURL = previous })
+}
+
+// withFreshProjectCache isolates a test from the package-level project cache,
+// which is keyed by credential and therefore shared between tests that reuse a
+// cookie value.
+func withFreshProjectCache(t *testing.T) {
+	t.Helper()
+	projectMu.Lock()
+	previous := projectCache
+	projectCache = map[string]projectEntry{}
+	projectMu.Unlock()
+	t.Cleanup(func() {
+		projectMu.Lock()
+		projectCache = previous
+		projectMu.Unlock()
+	})
+}
+
 func jsonString(s string) string {
 	raw, _ := json.Marshal(s)
 	return string(raw)
@@ -352,6 +377,116 @@ func TestResolveModelWithoutCatalogPassesThrough(t *testing.T) {
 		// used rather than advertising nothing.
 		if got, err := resolveModel(context.Background(), client, "", ""); err != nil || got != fallbackModel {
 			t.Errorf("resolveModel(\"\", \"\") = %q, %v; want %q", got, err, fallbackModel)
+		}
+	})
+}
+
+// prism creates a project per call unless one is reused, and the in-memory
+// cache does not survive a restart, so ensureProject has to find its own work.
+func TestEnsureProjectReusesOwnProject(t *testing.T) {
+	withFreshProjectCache(t)
+
+	var created int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/api/file-management/projects":
+			_, _ = w.Write([]byte(`{"projects":[{"uuid":"newest","title":"CLIProxyAPI"},
+			                                        {"uuid":"older","title":"CLIProxyAPI"},
+			                                        {"uuid":"mine","title":"我的论文"}]}`))
+		case r.URL.Path == "/api/projects":
+			created++
+			_, _ = w.Write([]byte(`{"uuid":"fresh"}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	withBaseURL(t, server.URL)
+
+	client, err := newPrismClient(&storedAuth{Cookies: "c=1"})
+	if err != nil {
+		t.Fatalf("newPrismClient: %v", err)
+	}
+	cfg := defaultConfig()
+	withConfig(t, cfg, func() {
+		got, err := client.ensureProject(context.Background())
+		if err != nil {
+			t.Fatalf("ensureProject: %v", err)
+		}
+		if got != "newest" {
+			t.Errorf("project = %q, want the newest project this plugin created", got)
+		}
+		if created != 0 {
+			t.Errorf("created %d projects, want 0", created)
+		}
+	})
+}
+
+// When creation is unavailable (prism answers 503 "Project storage is
+// temporarily unavailable" while reads keep working) any existing project beats
+// failing the turn.
+func TestEnsureProjectFallsBackWhenCreationFails(t *testing.T) {
+	withFreshProjectCache(t)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/file-management/projects":
+			_, _ = w.Write([]byte(`{"projects":[{"uuid":"someone-elses","title":"我的论文"}]}`))
+		case "/api/projects":
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte(`{"error":{"message":"503: Project storage is temporarily unavailable."}}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	withBaseURL(t, server.URL)
+
+	client, err := newPrismClient(&storedAuth{Cookies: "c=1"})
+	if err != nil {
+		t.Fatalf("newPrismClient: %v", err)
+	}
+	withConfig(t, defaultConfig(), func() {
+		got, err := client.ensureProject(context.Background())
+		if err != nil {
+			t.Fatalf("ensureProject: %v", err)
+		}
+		if got != "someone-elses" {
+			t.Errorf("project = %q, want the existing project", got)
+		}
+	})
+}
+
+// A fresh account still gets a project, and the created id is what the caller
+// sees even if the response omits it.
+func TestEnsureProjectCreatesWhenNothingExists(t *testing.T) {
+	withFreshProjectCache(t)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/file-management/projects":
+			_, _ = w.Write([]byte(`{"projects":[]}`))
+		case "/api/projects":
+			_, _ = w.Write([]byte(`{"title":"CLIProxyAPI"}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	withBaseURL(t, server.URL)
+
+	client, err := newPrismClient(&storedAuth{Cookies: "c=1"})
+	if err != nil {
+		t.Fatalf("newPrismClient: %v", err)
+	}
+	withConfig(t, defaultConfig(), func() {
+		got, err := client.ensureProject(context.Background())
+		if err != nil {
+			t.Fatalf("ensureProject: %v", err)
+		}
+		// The response named no uuid, so the client-minted one has to be used.
+		if got == "" || got != client.projectID || got == "fresh" {
+			t.Errorf("project = %q (client %q), want the client-minted UUID", got, client.projectID)
 		}
 	})
 }
