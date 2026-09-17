@@ -1,0 +1,123 @@
+name: Build and publish release
+
+# Tag with v<dotted numeric version> and push; this builds the per-platform zips
+# the CLIProxyAPI plugin store wants and attaches them to the release.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build and publish (for example v0.1.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Test, build, and publish
+    runs-on: ubuntu-latest
+    env:
+      PLUGIN_ID: prism-provider
+      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+    steps:
+      - name: Check out the release tag
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # The tag, the compiled-in version and the store listing must agree: the
+      # listing's `version` is only a display fallback, so a mismatch would ship
+      # a binary whose metadata disagrees with the advertised release.
+      - name: Validate tag and repository versions
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "invalid release tag: $RELEASE_TAG" >&2
+            exit 1
+          fi
+          version="${RELEASE_TAG#v}"
+          source_version="$(sed -n 's/^var version = "\([^"]*\)"/\1/p' main.go)"
+          registry_version="$(grep -A3 '"id": "prism-provider"' registry.json | sed -n 's/.*"version": "\([^"]*\)".*/\1/p' | head -1)"
+          for item in "source:$source_version" "registry:$registry_version"; do
+            if [ "${item#*:}" != "$version" ]; then
+              echo "version mismatch ($item, tag:$version)" >&2
+              exit 1
+            fi
+          done
+          case "$registry_version" in v*) echo "registry.json version must not start with v" >&2; exit 1 ;; esac
+          git rev-parse --verify "refs/tags/$RELEASE_TAG^{commit}" >/dev/null
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Install C toolchains and archive tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc gcc-mingw-w64-x86-64 binutils zip unzip
+
+      - name: Test
+        run: |
+          go test -race ./...
+          go vet ./...
+          test -z "$(gofmt -l -- *.go)"
+
+      - name: Build release archives
+        env:
+          CC_linux_amd64: gcc
+          CC_windows_amd64: x86_64-w64-mingw32-gcc
+          PLATFORMS: "linux/amd64 windows/amd64"
+        run: bash tools/package-release.sh "${{ steps.version.outputs.version }}"
+
+      # Structure, checksums and the four exported symbols are what the
+      # installer and the host loader actually depend on, so they are asserted
+      # rather than assumed.
+      - name: Verify archives and ABI
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ steps.version.outputs.version }}"
+          cd release-assets
+          sha256sum -c checksums.txt
+          test "$(wc -l < checksums.txt)" -eq 2
+          test "$(unzip -Z1 "${PLUGIN_ID}_${version}_linux_amd64.zip")" = "${PLUGIN_ID}.so"
+          test "$(unzip -Z1 "${PLUGIN_ID}_${version}_windows_amd64.zip")" = "${PLUGIN_ID}.dll"
+          unzip -p "${PLUGIN_ID}_${version}_linux_amd64.zip" "${PLUGIN_ID}.so" > /tmp/plugin.so
+          unzip -p "${PLUGIN_ID}_${version}_windows_amd64.zip" "${PLUGIN_ID}.dll" > /tmp/plugin.dll
+          for symbol in cliproxy_plugin_init cliproxyPluginCall cliproxyPluginFree cliproxyPluginShutdown; do
+            nm -D --defined-only /tmp/plugin.so | grep -Eq "[[:space:]]${symbol}$"
+            x86_64-w64-mingw32-objdump -p /tmp/plugin.dll | grep -Eq "[[:space:]]${symbol}$"
+          done
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ steps.version.outputs.version }}"
+          assets=(
+            "release-assets/${PLUGIN_ID}_${version}_linux_amd64.zip"
+            "release-assets/${PLUGIN_ID}_${version}_windows_amd64.zip"
+            "release-assets/checksums.txt"
+          )
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" "${assets[@]}" --clobber
+          else
+            gh release create "$RELEASE_TAG" "${assets[@]}" \
+              --verify-tag --title "$RELEASE_TAG" --generate-notes
+          fi

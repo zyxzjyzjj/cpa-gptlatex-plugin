@@ -1,0 +1,40 @@
+# 统一行尾，让仓库在任何平台上行为一致。
+#
+# 不写这个文件时，Windows 上 Git 会把文件检出成 CRLF：CRLF 的 shell 脚本在
+# Linux/macOS 上会以 `bash: ./build.sh: /bin/bash^M: bad interpreter` 失败，
+# 而在 autocrlf=false 的机器上克隆又会拿到 LF 的 .bat，批处理同样跑不起来。
+# 两份脚本各自固定行尾后，克隆方的 Git 配置就不再影响结果。
+
+# 默认：仓库内存 LF。
+* text=auto eol=lf
+
+# 脚本必须保持各自宿主期望的行尾。
+*.sh      text eol=lf
+*.bash    text eol=lf
+*.bat     text eol=crlf
+*.cmd     text eol=crlf
+*.ps1     text eol=crlf
+
+# Go 源码与模块：一律 LF。
+*.go      text eol=lf
+go.mod    text eol=lf
+go.sum    text eol=lf
+
+# 文档与配置。
+*.md      text eol=lf
+*.yaml    text eol=lf
+*.yml     text eol=lf
+*.json    text eol=lf
+
+# 二进制产物绝不能被行尾转换或当作文本 diff。
+# 它们已在 .gitignore 里；这里是给"故意提交"的人兜底。
+*.dll     binary
+*.so      binary
+*.dylib   binary
+*.exe     binary
+*.zip     binary
+*.png     binary
+*.jpg     binary
+*.ttf     binary
+*.woff    binary
+*.woff2   binary

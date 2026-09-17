@@ -1,0 +1,66 @@
+# ─────────────────────────────────────────────────────────────────────
+# prism-provider 的忽略规则
+#
+# 原则：**能重新生成的、以及任何可能承载凭据的，都不入库。**
+# ─────────────────────────────────────────────────────────────────────
+
+# ── 构建产物（可重新生成） ──────────────────────────────────────────
+# cgo 会为 c-shared 构建生成同名头文件，不需要版本控制
+prism-provider.h
+# 动态库本体；分发走 release zip / 插件商店，不靠仓库
+prism-provider.dll
+prism-provider.so
+prism-provider.dylib
+# 本机测试与工具产生的可执行文件
+*.exe
+# go test / coverage
+*.test
+*.out
+coverage.txt
+
+# ── 发布打包输出（tools/package-release.sh 生成） ───────────────────
+release-assets/
+
+# ── plugins/ 下的二进制 ─────────────────────────────────────────────
+# 目录结构保留，但库文件不入库：商店安装时从 release zip 取。
+# 若你希望像 cpa-codearts-plugin 那样把编译好的库一并提交（约 13 MB，
+# 且每次重建都会进历史），把下面三行注释掉即可。
+plugins/**/*.dll
+plugins/**/*.so
+plugins/**/*.dylib
+
+# ── 凭据：绝对不入库 ────────────────────────────────────────────────
+# 真实 config.yaml 含 prism 的整行 Cookie；只有 config.example.yaml 入库
+config.yaml
+# CPA 的凭据目录（导入的 cookie / token 就落在这里）
+auth/
+auths/
+# 抓包：原始 HAR 内含真实 cookie、JWT、沙箱 token
+*.har
+*.log
+
+# ── 本机分析产物（由抓包派生的工作笔记，脱敏前含真实 token） ────────
+# 结论已经蒸馏进 docs/prism-protocol.md，这些原始笔记不入库。
+tools/dense_*.md
+tools/f1*.md
+tools/index_R*.md
+tools/js_bundles.md
+
+# ── 本机测试宿主（57 MB，从 CLIProxyAPI 源码现编） ──────────────────
+tools/hostcheck/cpa-host.exe
+# 运行目录：内含带真实凭据的 config.yaml、暂存的凭据文件、日志
+tools/hostcheck/run/
+
+# ── Python（tools/ 下的辅助脚本） ───────────────────────────────────
+__pycache__/
+*.pyc
+
+# ── 编辑器 / 操作系统 ──────────────────────────────────────────────
+.idea/
+.vscode/
+*.iml
+.DS_Store
+Thumbs.db
+desktop.ini
+*~
+*.swp

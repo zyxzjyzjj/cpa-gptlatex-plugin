@@ -1,0 +1,30 @@
+# CLIProxyAPI configuration for the prism-provider plugin.
+# Copy to config.yaml and fill in the cookies.
+plugins:
+  enabled: true          # MUST be true: installing a plugin does not switch this on
+  dir: "plugins"         # plugins/<GOOS>/<GOARCH>/prism-provider.<ext> is also picked up
+  configs:
+    prism-provider:
+      enabled: true
+      priority: 1
+
+      # ── required ─────────────────────────────────────────────────────
+      # Sign in once via the Management UI, or paste a credential file into
+      # auth-dir. Either way the plugin stores the session itself; this field
+      # only seeds the cookie jar when no credential exists yet.
+      cookies: ""
+
+      # ── optional ─────────────────────────────────────────────────────
+      user_id: ""              # user-xxxx; probed from /auth/session when empty
+      project_uuid: ""         # reuse an existing project; created once and cached when empty
+      project_title: "CLIProxyAPI"
+      default_model: "gpt-6-astra"
+      reasoning_effort: "medium"   # low | medium | high | xhigh
+      system_prompt: ""
+      models: ["gpt-6-astra"]
+
+      # Leave this on. Without a sandbox prism answers every turn with
+      # sandbox_reconnecting and never produces output; the plugin performs the
+      # full handshake (resource token, y-sweet token, Yjs sync) and caches it
+      # per project.
+      sandbox: true

@@ -1,0 +1,17 @@
+{
+  "id": "prism-provider",
+  "name": "Prism",
+  "description": "prism.openai.com provider: browser sign-in (paste the callback URL), LaTeX sandbox workspace sync, OpenAI-compatible chat-completions.",
+  "author": "zyxzjyzjj",
+  "version": "0.1.1",
+  "repository": "https://github.com/zyxzjyzjj/cpa-gptlatex-plugin",
+  "homepage": "https://github.com/zyxzjyzjj/cpa-gptlatex-plugin",
+  "license": "MIT",
+  "tags": [
+    "provider",
+    "auth",
+    "prism",
+    "latex",
+    "chat-completions"
+  ]
+}

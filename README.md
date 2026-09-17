@@ -1,0 +1,288 @@
+# prism-provider — 把 prism.openai.com 网页订阅接入 CLIProxyAPI
+
+这是一个 **CLIProxyAPI (CPA) provider 插件**，注册名为 `prism-provider`。
+它把 OpenAI 的 LaTeX 编辑器 [prism.openai.com](https://prism.openai.com) 的网页订阅，
+包装成 OpenAI 兼容的 `chat-completions` 上游，于是你可以在 CPA 里像管理其它订阅一样集中管理它。
+
+协议细节见 [`docs/prism-protocol.md`](docs/prism-protocol.md) —— 全文逐字摘自抓包与站点自身的前端代码。
+
+---
+
+## 1. 它做了什么
+
+```
+客户端 ──chat/completions──► CLIProxyAPI ──插件──► prism.openai.com
+                                                    POST /api/llm/response_with_tools_start
+                                                    POST /api/llm/response_with_tools_status (轮询)
+```
+
+一次请求的完整流程：
+
+1. 用你提供的 **cookie** 调 `GET /auth/session`，取到 `openai_user_id`（形如 `user-…`）。
+2. 若还没有项目，`POST /api/projects` 创建一个（`project_uuid` 由客户端生成）。
+3. 把 `messages` 转成 Prism 的 Responses 风格 `input` 数组。
+4. `POST /api/llm/response_with_tools_start`，body 为
+   `{input, previousResponseId, metadata:{projectId, userId, model, reasoning_effort, frontend_origin}, conversationId}`。
+5. 若 `status=="started"`（或 `"pending"`）就每 5 秒 `POST /api/llm/response_with_tools_status`，
+   body 为 `{request_id, turn_state}`，直到 `status=="completed"`。
+6. 从 `response.payload.output` 里取 `type=="message" && role=="assistant"` 的 `output_text`，拼成回答。
+
+`response.payload.reason == "SandboxReconnecting"` **不是错误**：网页端会等沙箱就绪后重发同一轮请求，插件同样重试最多 3 次。
+
+---
+
+## 2. 构建
+
+需要 **Go 1.26**（与宿主保持一致；c-shared 动态库跨 Go 版本加载风险最大），
+并且**插件本身必须用 CGO 构建**——宿主加载后只查找 `cliproxy_plugin_init` 一个符号。
+
+宿主那边不一定需要 CGO：Windows 的 `loader_windows.go` 构建约束是 `//go:build windows`，
+用 `syscall.LoadDLL` 就够；只有 Linux/macOS 的 `loader_unix.go` 才带 `cgo` 约束。
+
+```bash
+cd prism
+./build.sh            # 自动找 C 编译器，产出 prism-provider.dll / .so / .dylib
+make build            # 有 make 时等价
+```
+
+Windows 上也可以直接用批处理（会自动建好 `plugins\windowsmd64\`）：
+
+```bat
+build.bat
+```
+
+手动等价命令：
+
+```bash
+CGO_ENABLED=1 go build -trimpath -buildmode=c-shared -o prism-provider.dll .
+```
+
+**cgo 需要一个 C 编译器。** 这台机器上 `gcc` 不在 PATH 里（只有 Git 自带的 `mingw64` 目录，不含编译器），
+已额外解包了一份可移植 MinGW-w64 到 `C:\zjj\toolchain\mingw64`，`build.sh` / `Makefile` 会自动回退到它。
+要换编译器就设 `CC`：
+
+```bash
+CC=/path/to/gcc ./build.sh
+```
+
+> 扩展名必须对：macOS `.dylib`、Linux `.so`、Windows `.dll`。平台不匹配宿主会直接加载失败。
+> 构建产物约 13 MB（Go 运行时是静态链进动态库的）。
+
+### 版本与 ABI 约束（改代码前务必先读）
+
+插件**刻意不依赖 `github.com/router-for-me/CLIProxyAPI/v7`**，`main.go` 里自己镜像了 ABI 常量。
+原因不是洁癖，而是依赖它会导致插件**完全无法加载**：
+
+- 宿主会拒绝 `schema_version` 高于自己的插件
+  （`internal/pluginhost/rpc_client.go`：`plugin schema version %d is not supported`）。
+- 而 `pluginabi.SchemaVersion` 随 CPA 版本漂移：本地 checkout 是 **v7.2.50 → 1**，
+  v7.2.129 → 3，v7.3.4 → 6。之前 `go.mod` 锁的是 v7.2.129，
+  于是插件对外声称 schema_version=3，被 v7.2.50 的宿主在注册阶段直接拒绝。
+- 因此常量固定在 `schemaVersion = 1`：它是**唯一**能被上述所有宿主接受的取值，
+  也正是本插件实际实现的协议版本。`abiVersion = 1` 同理。
+
+删掉 CPA 依赖还顺带把依赖树从 50 MB 缩到只剩 `gopkg.in/yaml.v3`，并且不再需要 go1.26 工具链切换。
+
+---
+
+## 2.5 自检
+
+两个层次的自检都是离线、不需要 cookie 的：
+
+```bash
+cd prism
+go test ./...          # 17 个单元测试：配置解析、chat→prism 映射、响应封装、凭据
+make check             # 真·加载动态库，按宿主 loader 的方式跑全部 RPC
+```
+
+`make check` 调用 [`tools/plugincheck`](tools/plugincheck)，
+它按 `internal/pluginhost/loader_windows.go` 的**同一套结构体布局与回调约定**加载 `.dll`，
+真的走 `cliproxy_plugin_init` → `cliproxyPluginCall`，覆盖 27 项断言：
+`plugin.register`（含空配置、坏配置、`ConfigField.Type` 合法性、schema_version 上限）、
+`auth.parse`（含拒绝异种凭据）、`model.static` / `model.for_auth`、
+`executor.count_tokens`、未知方法、**空指针 method**（不做判空会段错误）、`plugin.shutdown`。
+
+唯一测不到的是真正打到 `prism.openai.com` 的那几跳——那需要你的 cookie。
+
+第三个层次是**真实宿主**：把 `.dll` 塞进一个本地构建的 CLIProxyAPI v7.2.50 里跑，
+看宿主自己怎么报告。详见 [`tools/hostcheck`](tools/hostcheck)。
+
+---
+
+### 发布（Windows）
+
+```bat
+release.bat 0.1.1 --dry-run    :: 只做校验，不改任何东西
+release.bat 0.1.1              :: 确认后：同步版本号 → 提交 → 推 master → 打 tag → CI 出包
+release.bat 0.1.1 --yes        :: 跳过确认
+```
+
+它先用 `tools/set-version.ps1` 把 `main.go` 的 `var version`、`registry.json`、`registry-entry.json` 三处版本号同步成同一个值，再推 tag 触发 `release.yml`。前置校验：分支必须是 `master`、`origin` 必须存在、本地与远端都不能已有该 tag、版本号必须是点分数字形式。完整说明见 [docs/plugin-store.md](docs/plugin-store.md)。
+
+---
+
+## 3. 安装与配置
+
+把动态库放到 CPA 的插件目录（按平台分目录更规范）：
+
+```
+<CLIProxyAPI 根目录>/
+├── config.yaml
+└── plugins/
+    ├── prism-provider.so
+    ├── linux/amd64/prism-provider.so
+    └── windows/amd64/prism-provider.dll
+```
+
+**插件 ID = 文件名去掉扩展名**，也就是 `prism-provider`——`config.yaml` 里的配置键必须与它一致
+（注意：是文件名，不是插件注册的 provider 名，两者这里刚好相同）。
+
+`config.yaml`：
+
+```yaml
+plugins:
+  enabled: true            # 全局开关，必须打开（商店安装不会自动打开它）
+  dir: "plugins"
+  configs:
+    prism-provider:
+      enabled: true
+      priority: 1
+
+      # ── 必填 ──────────────────────────────────────────────
+      # 浏览器登录 prism.openai.com 后，把该站点的 Cookie 请求头整行复制过来。
+      # 实测必需的两个（名称已从 Fiddler 抓包确认）：
+      #   prism_session_token      —— 会话（GET /auth/session 会续期，Max-Age=43200）
+      #   prism_oai_access_token   —— OpenAI 访问令牌（RS256 JWT）
+      # 建议一并带上 cf_clearance / __cf_bm，否则可能被 Cloudflare 拦。
+      cookies: "prism_session_token=...; prism_oai_access_token=...; cf_clearance=...; __cf_bm=...; __cflb=...; oai-did=...; prism-did=..."
+
+      # ── 选填 ──────────────────────────────────────────────
+      user_id: ""              # 形如 user-xxxx；留空自动从 /auth/session 探测
+      project_uuid: ""         # 复用的项目 UUID；留空则首次调用时自动创建
+      project_title: "CLIProxyAPI"
+      # 领取 LaTeX 沙箱并完成工作区同步。**建议保持开启**：
+      # 实测（2026-09-17）不提供沙箱时服务端只会一直返回 sandbox_reconnecting，
+      # 整轮永远拿不到答案。插件会自动做完整握手（资源令牌 → y-sweet 令牌 →
+      # Yjs socket 同步 → wait-for-sync），并按项目缓存复用，所以只有首次请求
+      # 会多等几秒。默认开。
+      sandbox: true
+      default_model: "gpt-6-astra"
+      reasoning_effort: "medium"   # low | medium | high | xhigh
+      system_prompt: ""            # 客户端没给 system 消息时用这个
+      models: ["gpt-6-astra"]
+```
+
+> `models` 三种写法都认：单行 JSON 数组字符串（CPA 文档的写法）、真正的 YAML 列表、以及带 `id` 字段的对象数组。
+
+> **首次跑通建议：把 `user_id` 和 `project_uuid` 都填上。** 两个都非空时会短路掉两次多余往返——`metadata.userId` 直接用你给的值（不再调 `GET /auth/session`），项目直接用你给的 UUID（不再调 `POST /api/projects`）。既省一次往返，也让你明确复用浏览器里已有的那个项目。
+>
+> 这两个端点本身**已经和抓包核对过**：`POST /api/projects` 的请求体/响应体逐字段一致（见 [`docs/prism-protocol.md`](docs/prism-protocol.md) §4.1 与 A6），`GET /auth/session` 的字段名也实测确认（同上）。
+>
+> `project_uuid` 就是浏览器地址栏里 `?u=` 后面那段：`https://prism.openai.com/?u=<project_uuid>&pg=1&m=main.tex`。
+
+> **必须让 CPA 走代理，否则一定 403。** 本机直连 prism.openai.com 时出口 IP 会被 Cloudflare 判定为异常流量，**连首页都打不开**，且与 cookie 无关（详见 §4「如果返回 403」）。这是网络层的事，**不要写进插件配置**——给 CPA 进程设 `HTTPS_PROXY` 即可（插件用 Go 默认 transport，自动读取）。
+
+改完配置后**重启（或重新安装）CPA**——动态库不会热替换。
+
+---
+
+## 4. 验证
+
+管理 API 的路由是 **`/v0/management/...`**（不是 `/v1/`），且**即使本机访问也要带 `remote-management.secret-key`**，
+不带 key 时所有 `/v0/management` 路由都是 404：
+
+```bash
+curl -s -H "Authorization: Bearer $CPA_MGMT_KEY" \
+  http://127.0.0.1:8319/v0/management/plugins \
+  | jq '.plugins[] | select(.id=="prism-provider")'
+```
+
+关键字段（下面这段是**在真实宿主里实测到的**输出，不是期望值）：
+
+```json
+{
+  "id": "prism-provider",
+  "configured": true,
+  "registered": true,
+  "enabled": true,
+  "effective_enabled": true,
+  "supports_oauth": true,
+  "oauth_provider": "prism-provider",
+  "config_fields": [
+    {"name": "sandbox", "type": "boolean"},
+    {"name": "reasoning_effort", "type": "enum", "enum_values": ["low","medium","high","xhigh"]}
+  ]
+}
+```
+
+模型列表（模型由 `model.for_auth` 挂在导入的凭据上，所以**必须先导入 cookie**，否则是空的）：
+
+```bash
+curl -s -H "Authorization: Bearer $CPA_KEY" http://127.0.0.1:8319/v1/models | jq
+# {"data":[{"id":"gpt-6-astra","object":"model","owned_by":"prism-provider"}, ...]}
+```
+
+真实对话：
+
+```bash
+curl -s http://127.0.0.1:8319/v1/chat/completions \
+  -H "Authorization: Bearer $CPA_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"gpt-6-astra",
+       "messages":[{"role":"user","content":"用一句话解释 LaTeX 的 \\label 有什么用"}]}'
+```
+
+### 如果返回 403 / Cloudflare
+
+**这不是 cookie 的问题，是出口 IP 的问题。** 2026-09-17 实测：本机直连时，**连首页 `/` 都会被拦**，返回 4577 字节的 `Attention Required!` 拦截页，而且**带不带 cookie 响应逐字节相同**；改走美国出口后，同一个请求 `/auth/session` 直接 200、首页 132 KB 正常渲染。所以补 `cf_clearance` 没有用，也**不需要**任何 TLS 指纹伪装。
+
+修法是给 **CPA 进程**设代理环境变量。插件用的是 Go 默认 transport，会自动读这两个变量，**不需要改插件、也不要把代理写进插件配置**：
+
+```bash
+# Linux / macOS
+HTTPS_PROXY=socks5://127.0.0.1:15732 ./cli-proxy-api -config config.yaml
+
+# Windows（PowerShell）
+$env:HTTPS_PROXY="socks5://127.0.0.1:15732"; .\cli-proxy-api.exe -config config.yaml
+```
+
+`http://`、`socks5://` 都支持；本机实测可用的是 `127.0.0.1:15732`（ViewTurbo，同时提供 HTTP 与 SOCKS5，也是这台机器的系统代理）。
+
+设好之后，插件会正常打到 prism 的应用层。若此时仍报错，看到的就是 prism 自己的错误了，例如：
+
+```json
+{"error":{"message":"prism POST /api/llm/response_with_tools_start 返回 500: {\"status\":\"error\",\"message\":\"auth-session-policy-unavailable\"}"}}
+```
+
+这条的意思是**凭据无效**——也就是说网络已经通了，剩下才是 cookie 的事。
+
+---
+
+## 5. 已知限制
+
+- **cookie 会过期。** 目前 `auth.refresh` 只做校验并把 `NextRefreshAfter` 定在 12 小时后；cookie 失效时会返回 401，需要重新粘贴 cookie。
+- **不支持流式增量。** Prism 是「start + 轮询」而非 SSE，答案一次产出，所以 `execute_stream` 走的是 CPA 的**同步 chunks** 通道（一次性回放），不是逐 token 推送。要做到真正的增量得改用 `host.stream.emit`；插件现在**已经**具备调用宿主回调的能力（`host.log` 就是这么走的，见 `callHost`），但仍刻意不碰 `host.stream.emit`——它的 wire 契约在 SDK 里没有文档化的例子，猜错会直接破坏流式响应。
+- **`executor.count_tokens` 是桩，恒返回 `total_tokens: 0`。** Prism 不回报 usage，也没有分词器；这里选择与 CPA 自带参考插件完全一致的返回，而不是编一个估算值。若客户端依赖它做上下文预检，会看到 0。
+- **沙箱是必需的，不是可选项。** 实测：不提供 `sandbox_url` 时服务端只回 `sandbox_reconnecting`，整轮永不成功；而只领沙箱不做后续握手，`wait-for-sync` 会一直停在 `syncing`，`response_with_tools_start` 在 prism 自己的网关超时（约 123 秒）后以 504 失败。插件现在会完整走完这一步（见 `docs/prism-protocol.md` A8.3）：项目资源令牌 → y-sweet 令牌（原样转发给沙箱 `/token`）→ 连上 Yjs socket 并保持 → 轮询 `wait-for-sync` 到 `synced`。**那条 WebSocket 必须全程保持**，插掉沙箱就会退回 `syncing`；插件按项目缓存整套（TTL 10 分钟），传输层出错会自动丢弃并重新领取。
+- **多轮对话是"无状态"的。** 每次请求都把完整的 `messages` 转成 `input` 发上去，不维护 `previousResponseId` / `conversationId`。实测 Prism 网页端只用 2 条 input + `previousResponseId` 做续接，语义不同；本插件走的是 chat-completions 的全量历史语义，能正常工作但每轮上传的上下文更大。
+- **上游调用用标准库 `net/http`，没有走 `host.http.do` 桥。** 功能上等价，但会绕过宿主的代理与请求日志策略。要接管这部分，把 `prismClient.do` 换成宿主桥即可（只有一个函数）。
+- **模型名不校验。** `models` 里的名字会原样发给 `metadata.model`；Prism 侧实际支持哪些模型以网页端 `useAvailableCodexModels()` 为准。
+
+---
+
+## 6. 文件一览
+
+| 文件 | 作用 |
+|---|---|
+| `main.go` | C ABI 导出、方法分发、注册清单、信封编解码、宿主回调（`host.log`） |
+| `config.go` | 解析 `plugins.configs.prism-provider` YAML |
+| `auth.go` | `auth.parse` / `auth.refresh` / `model.static` / `model.for_auth` |
+| `prism.go` | Prism HTTP 客户端：会话、建项目、start/status 轮询、沙箱 |
+| `executor.go` | chat-completions ↔ Prism Responses 风格 `input` 的互转，以及响应封装 |
+| `prism_test.go` | 单元测试：配置解析、消息映射、响应封装、凭据 |
+| `build.sh` | 找编译器并构建（无 make 时用这个） |
+| `build.bat` / `release.bat` | Windows 上的构建与发布脚本 |
+| `tools/set-version.ps1` | 把 tag 版本号同步进 main.go 与两份 registry |
+| `tools/package-release.sh` | 打出商店要求的 zip 与 checksums.txt |
+| `registry.json` / `registry-entry.json` | 第三方商店源与官方商店条目 |
+| `Makefile` | 构建 / 测试 / 自检 / fmt / vet |
