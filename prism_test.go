@@ -1005,3 +1005,96 @@ func TestParseAuthAcceptsHostCallbackFile(t *testing.T) {
 		t.Fatalf("message = %+v, want it to be about the pending flow", env.Error)
 	}
 }
+
+// ------------------------------------------------------------------ management
+
+// The plugin registers its own sign-in endpoint because the host's callback box
+// rejects prism's state (484 chars vs the host's 128-char limit).
+func TestManagementRegisterExposesCallbackRoute(t *testing.T) {
+	out, err := handleManagementRegister()
+	if err != nil {
+		t.Fatalf("handleManagementRegister: %v", err)
+	}
+	var env struct {
+		OK     bool `json:"ok"`
+		Result struct {
+			Routes []struct {
+				Method string `json:"Method"`
+				Path   string `json:"Path"`
+			} `json:"Routes"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(out, &env); err != nil {
+		t.Fatalf("envelope decode: %v", err)
+	}
+	if !env.OK || len(env.Result.Routes) == 0 {
+		t.Fatalf("registration = %s", out)
+	}
+	methods := map[string]bool{}
+	for _, route := range env.Result.Routes {
+		if route.Path != callbackPath {
+			t.Errorf("route path = %q, want %q", route.Path, callbackPath)
+		}
+		methods[route.Method] = true
+	}
+	if !methods["POST"] || !methods["GET"] {
+		t.Errorf("routes must cover POST and GET, got %v", methods)
+	}
+}
+
+// Both accepted shapes -- query parameters and a JSON body -- must reach the
+// completion path. With no flow in flight that path fails, and the failure has
+// to be about the flow, which is what proves the callback was parsed.
+func TestManagementHandleAcceptsBothShapes(t *testing.T) {
+	loginMu.Lock()
+	previous := activeLogin
+	activeLogin = nil
+	loginMu.Unlock()
+	defer func() { loginMu.Lock(); activeLogin = previous; loginMu.Unlock() }()
+
+	const cb = "https://prism.openai.com/auth/popup-callback?code=ac_MGMT&state=prism_openai_oauth_state.v1.x.y"
+	requests := []string{
+		`{"Method":"POST","Path":"` + callbackPath + `","Query":{"redirect_url":["` + cb + `"]}}`,
+		`{"Method":"POST","Path":"` + callbackPath + `","Body":"` + base64.StdEncoding.EncodeToString([]byte(`{"redirect_url":"`+cb+`"}`)) + `"}`,
+	}
+	for i, request := range requests {
+		out, err := handleManagementHandle([]byte(request))
+		if err != nil {
+			t.Fatalf("shape %d: %v", i, err)
+		}
+		var env struct {
+			OK     bool `json:"ok"`
+			Result struct {
+				StatusCode int    `json:"StatusCode"`
+				Body       []byte `json:"Body"`
+			} `json:"result"`
+		}
+		if err := json.Unmarshal(out, &env); err != nil {
+			t.Fatalf("shape %d: envelope decode: %v", i, err)
+		}
+		if env.Result.StatusCode != 400 {
+			t.Errorf("shape %d: StatusCode = %d, want 400", i, env.Result.StatusCode)
+		}
+		if !strings.Contains(string(env.Result.Body), "登录流程") {
+			t.Errorf("shape %d: body = %s, want it to be about the pending flow", i, env.Result.Body)
+		}
+	}
+
+	// A request with no callback at all must be rejected with guidance.
+	out, err := handleManagementHandle([]byte(`{"Method":"GET","Query":{}}`))
+	if err != nil {
+		t.Fatalf("empty request: %v", err)
+	}
+	var emptyEnv struct {
+		OK     bool `json:"ok"`
+		Result struct {
+			Body []byte `json:"Body"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(out, &emptyEnv); err != nil {
+		t.Fatalf("empty request: envelope decode: %v", err)
+	}
+	if !strings.Contains(string(emptyEnv.Result.Body), "redirect_url") {
+		t.Errorf("empty request should say what to send: %s", emptyEnv.Result.Body)
+	}
+}

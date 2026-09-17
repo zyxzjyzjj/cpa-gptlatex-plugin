@@ -126,6 +126,9 @@ const (
 	methodExecutorExecuteStream = "executor.execute_stream"
 	methodExecutorCountTokens   = "executor.count_tokens"
 
+	methodManagementRegister = "management.register"
+	methodManagementHandle   = "management.handle"
+
 	methodHostLog = "host.log"
 )
 
@@ -186,6 +189,7 @@ type capabilities struct {
 	ExecutorModelScope    string   `json:"executor_model_scope"`
 	ExecutorInputFormats  []string `json:"executor_input_formats,omitempty"`
 	ExecutorOutputFormats []string `json:"executor_output_formats,omitempty"`
+	ManagementAPI         bool     `json:"management_api,omitempty"`
 }
 
 type lifecycleRequest struct {
@@ -461,6 +465,10 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 		return handleExecute(request, true)
 	case methodExecutorCountTokens:
 		return handleCountTokens(request)
+	case methodManagementRegister:
+		return handleManagementRegister()
+	case methodManagementHandle:
+		return handleManagementHandle(request)
 	default:
 		// Unknown methods are reported as a failed call rather than a Go error
 		// so the host surfaces a clean envelope instead of a transport fault.
@@ -497,6 +505,11 @@ func reg() registration {
 			ExecutorModelScope:    "oauth",
 			ExecutorInputFormats:  []string{"chat-completions"},
 			ExecutorOutputFormats: []string{"chat-completions"},
+			// Exposes the plugin's own sign-in completion endpoint. The host's
+			// own callback box cannot be used because prism's OAuth state (~484
+			// chars) is far longer than the host's 128-character limit, so it
+			// rejects the callback with "invalid state" before looking for us.
+			ManagementAPI: true,
 		},
 	}
 }
