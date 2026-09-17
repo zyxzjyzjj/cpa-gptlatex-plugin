@@ -101,7 +101,15 @@ done
 current=("$OUT_DIR/${PLUGIN_ID}_${VERSION}_"*.zip)
 [ -e "${current[0]}" ] || { echo "no platform was built for $VERSION; nothing to package" >&2; exit 1; }
 
-OUT_DIR="$OUT_DIR" PREFIX="${PLUGIN_ID}_${VERSION}_" "$zip_tool" -c "$(cat <<'PYSUM'
+# checksums.txt must be "<sha256>  <bare-filename>": the installer splits on
+# whitespace, lower-cases the hash, strips a leading "*" (GNU binary marker) but
+# NOT a "./" prefix, so "./x.zip" would parse yet fail lookup.
+#
+# This branches on which tool built the archives. It has to: "$zip_tool" is
+# either zip(1) or a Python interpreter, and `zip -c` means "comment", not "run
+# this program" -- passing the Python source to zip fails with "Nothing to do".
+if [ "$zip_tool" != "zip" ]; then
+  OUT_DIR="$OUT_DIR" PREFIX="${PLUGIN_ID}_${VERSION}_" "$zip_tool" -c "$(cat <<'PYSUM'
 import hashlib, os
 out_dir, prefix = os.environ["OUT_DIR"], os.environ["PREFIX"]
 lines = []
@@ -115,6 +123,18 @@ with open(os.path.join(out_dir, "checksums.txt"), "w", newline="\n") as fh:
     fh.write("\n".join(lines) + "\n")
 PYSUM
 )"
+elif command -v sha256sum >/dev/null 2>&1; then
+  # Normalise to "<sha256>  <bare-name>". GNU prints "hash  ./file" in text mode
+  # and "hash *./file" in binary mode (the '*' replaces the first space), and the
+  # installer looks assets up by bare name -- a leftover "./" fails with
+  # "checksum for x.zip not found".
+  ( cd "$OUT_DIR" && sha256sum ./${PLUGIN_ID}_${VERSION}_*.zip | sed -e 's# \*\./#  #' -e 's#  \./#  #' > checksums.txt )
+elif command -v shasum >/dev/null 2>&1; then
+  ( cd "$OUT_DIR" && shasum -a 256 ./${PLUGIN_ID}_${VERSION}_*.zip | sed -e 's# \*\./#  #' -e 's#  \./#  #' > checksums.txt )
+else
+  echo "ERROR: no checksum tool available (install zip(1)/sha256sum(1)/shasum(1), or Python 3)" >&2
+  exit 1
+fi
 
 echo
 echo "release assets in $OUT_DIR:"
