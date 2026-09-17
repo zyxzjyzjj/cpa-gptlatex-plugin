@@ -275,3 +275,14 @@ func (b *browserLogin) debuggerURL(ctx context.Context) (string, error) {
 	}
 	return version.WebSocketDebuggerURL, nil
 }
+
+// loginLog reports sign-in progress through the host logger, so it shows up in
+// CPA's own output instead of a file the operator has to go find. Values that
+// are credentials -- cookies, the state, the authorize URL -- are never included.
+func loginLog(level, message string, fields map[string]any) {
+	if fields == nil {
+		fields = map[string]any{}
+	}
+	fields["component"] = "login"
+	hostLog(level, message, fields)
+}
