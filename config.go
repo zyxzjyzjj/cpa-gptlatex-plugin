@@ -25,13 +25,19 @@ type config struct {
 	EnableSandbox bool
 }
 
+// fallbackModel is used only when neither the config nor a live upstream
+// lookup can name a model: a credential-less first start with prism
+// unreachable. The real list comes from prism itself (see catalogFor).
+const fallbackModel = "gpt-5.6-sol"
+
 func defaultConfig() config {
 	return config{
 		ProjectTitle: "CLIProxyAPI",
-		// gpt-6-astra 是 2026-09-16 抓包中网页端实际使用的模型
-		// （/api/llm/response_with_tools_start 的 metadata.model）。
-		Models:          []string{"gpt-6-astra"},
-		DefaultModel:    "gpt-6-astra",
+		// Models 留空表示"按上游下发的清单走"：prism 的可选模型由 Statsig
+		// 动态配置决定，写死会过期（gpt-6-astra 一天之间就从可用变成 400）。
+		// 填了就在这里覆盖，供需要固定模型的部署使用。
+		Models:          nil,
+		DefaultModel:    "",
 		ReasoningEffort: "medium",
 		// 没有沙箱就拿不到答案。
 		EnableSandbox: true,

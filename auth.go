@@ -166,17 +166,71 @@ func handleRefreshAuth(request []byte) ([]byte, error) {
 }
 
 func handleModelStatic(_ []byte) ([]byte, error) {
-	return okEnvelope(modelResponse{Provider: providerName, Models: configuredModels()})
+	// No credential here, so this can only answer from cache or config.
+	return okEnvelope(modelResponse{Provider: providerName, Models: availableModels(nil)})
 }
 
-func handleModelForAuth(_ []byte) ([]byte, error) {
-	return okEnvelope(modelResponse{Provider: providerName, Models: configuredModels()})
+func handleModelForAuth(raw []byte) ([]byte, error) {
+	var req authModelRequest
+	if err := json.Unmarshal(raw, &req); err != nil || len(req.StorageJSON) == 0 {
+		return okEnvelope(modelResponse{Provider: providerName, Models: availableModels(nil)})
+	}
+	sa, err := parseStored(req.StorageJSON)
+	if err != nil {
+		return okEnvelope(modelResponse{Provider: providerName, Models: availableModels(nil)})
+	}
+	return okEnvelope(modelResponse{Provider: providerName, Models: availableModels(sa)})
 }
 
-func configuredModels() []modelInfo {
+// availableModels resolves the advertised model list:
+//
+//  1. an explicit `models:` list in the plugin config (operator override),
+//  2. the list prism publishes for this credential (cached for catalogTTL),
+//  3. the last list fetched for any credential,
+//  4. fallbackModel.
+//
+// Advertising the upstream list is what keeps the plugin usable across model
+// rotations: CPA only routes models its providers advertise, so a stale
+// hardcoded name is unreachable *and* a name that no longer exists upstream
+// fails the turn with an opaque 400.
+func availableModels(sa *storedAuth) []modelInfo {
 	cfg := currentConfig()
-	out := make([]modelInfo, 0, len(cfg.Models))
-	for _, id := range cfg.Models {
+	if len(cfg.Models) > 0 {
+		return modelInfos(cfg.Models)
+	}
+
+	var catalog *modelCatalog
+	if sa != nil {
+		if client, err := newPrismClient(sa); err == nil {
+			ctx, cancel := context.WithTimeout(context.Background(), catalogTimeout)
+			defer cancel()
+			if fetched, err := client.catalogFor(ctx); err == nil {
+				catalog = fetched
+			}
+		}
+	}
+	if catalog == nil {
+		catalog = defaultCatalog()
+	}
+	if catalog != nil {
+		ids := make([]string, 0, len(catalog.Models))
+		for _, m := range catalog.Models {
+			ids = append(ids, m.ID)
+		}
+		return modelInfos(ids)
+	}
+	if cfg.DefaultModel != "" {
+		return modelInfos([]string{cfg.DefaultModel})
+	}
+	return modelInfos([]string{fallbackModel})
+}
+
+func modelInfos(ids []string) []modelInfo {
+	out := make([]modelInfo, 0, len(ids))
+	for _, id := range ids {
+		if strings.TrimSpace(id) == "" {
+			continue
+		}
 		out = append(out, modelInfo{
 			ID:            id,
 			Object:        "model",
@@ -186,12 +240,6 @@ func configuredModels() []modelInfo {
 			Description:   "prism.openai.com 网页订阅",
 			ContextLength: 200000,
 			UserDefined:   true,
-		})
-	}
-	if len(out) == 0 {
-		out = append(out, modelInfo{
-			ID: cfg.DefaultModel, Object: "model", OwnedBy: providerName,
-			Type: "chat", DisplayName: cfg.DefaultModel, UserDefined: true,
 		})
 	}
 	return out

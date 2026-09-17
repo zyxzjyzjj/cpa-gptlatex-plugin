@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -115,8 +116,10 @@ func TestConfigureWithoutConfigKeepsDefaults(t *testing.T) {
 		if err := configure([]byte(`{"schema_version":1}`)); err != nil {
 			t.Fatalf("configure with no config_yaml: %v", err)
 		}
-		if got := currentConfig(); got.DefaultModel != "gpt-6-astra" {
-			t.Errorf("DefaultModel = %q, want the default", got.DefaultModel)
+		// No model is compiled in any more: the list comes from the upstream
+		// flags, so an unconfigured plugin advertises whatever prism offers.
+		if got := currentConfig(); len(got.Models) != 0 || got.DefaultModel != "" {
+			t.Errorf("Models = %v, DefaultModel = %q; want both unset", got.Models, got.DefaultModel)
 		}
 		if err := configure(nil); err != nil {
 			t.Fatalf("configure(nil): %v", err)
@@ -231,26 +234,124 @@ func jsonString(s string) string {
 	return string(raw)
 }
 
-func TestResolveModel(t *testing.T) {
-	cfg := defaultConfig()
-	cfg.Models = []string{"gpt-6-astra", "gpt-5-codex"}
-	withConfig(t, cfg, func() {
-		cases := []struct{ requested, body, want string }{
-			{"gpt-6-astra", "", "gpt-6-astra"},
-			{"", "gpt-5-codex", "gpt-5-codex"},
-			// Provider prefixes are stripped before matching.
-			{"prism-provider/gpt-5-codex", "", "gpt-5-codex"},
-			// Case-insensitive match returns the configured spelling.
-			{"GPT-6-ASTRA", "", "gpt-6-astra"},
-			// Unknown models pass through rather than being silently rewritten.
-			{"something-else", "", "something-else"},
-			// Nothing requested at all falls back to the default.
-			{"", "", "gpt-6-astra"},
+// The id in prism's /api/ff/initialize response is the djb2 hash of the config
+// name. This pins the rule to the value measured live (2026-09-17):
+// dynamic_configs["62892348"] is prism_codex_models.
+func TestStatsigConfigIDMatchesLiveResponse(t *testing.T) {
+	if got := statsigConfigID("prism_codex_models"); got != "62892348" {
+		t.Fatalf("statsigConfigID(prism_codex_models) = %q, want 62892348", got)
+	}
+}
+
+// withCatalog seeds the per-credential cache so resolveModel does not reach for
+// the network.
+func withCatalog(t *testing.T, client *prismClient, models ...string) {
+	t.Helper()
+	catalog := &modelCatalog{fetchedAt: time.Now()}
+	for _, id := range models {
+		catalog.Models = append(catalog.Models, modelOption{ID: id})
+	}
+	catalogMu.Lock()
+	previous, had := catalogCache[client.credKey]
+	catalogCache[client.credKey] = catalog
+	catalogMu.Unlock()
+	t.Cleanup(func() {
+		catalogMu.Lock()
+		if had {
+			catalogCache[client.credKey] = previous
+		} else {
+			delete(catalogCache, client.credKey)
 		}
-		for _, c := range cases {
-			if got := resolveModel(c.requested, c.body); got != c.want {
-				t.Errorf("resolveModel(%q, %q) = %q, want %q", c.requested, c.body, got, c.want)
+		catalogMu.Unlock()
+	})
+}
+
+func TestResolveModelFollowsUpstreamCatalog(t *testing.T) {
+	client, err := newPrismClient(&storedAuth{Cookies: "c=1"})
+	if err != nil {
+		t.Fatalf("newPrismClient: %v", err)
+	}
+	withCatalog(t, client, "gpt-5.6-sol", "gpt-5.6-terra")
+
+	cfg := defaultConfig()
+	cfg.Models = nil
+	withConfig(t, cfg, func() {
+		ctx := context.Background()
+
+		// A name the upstream offers is used as requested, provider prefix or not.
+		for _, requested := range []string{"gpt-5.6-terra", "prism-provider/gpt-5.6-terra"} {
+			got, err := resolveModel(ctx, client, requested, "")
+			if err != nil || got != "gpt-5.6-terra" {
+				t.Errorf("resolveModel(%q) = %q, %v; want gpt-5.6-terra", requested, got, err)
 			}
+		}
+
+		// Nothing requested: the first entry of the upstream list is the default,
+		// which is what the web client does too.
+		got, err := resolveModel(ctx, client, "", "")
+		if err != nil || got != "gpt-5.6-sol" {
+			t.Errorf("resolveModel(\"\", \"\") = %q, %v; want gpt-5.6-sol", got, err)
+		}
+
+		// A name prism has retired is refused by name instead of being forwarded
+		// and failing the turn with an opaque upstream 400.
+		if _, err := resolveModel(ctx, client, "gpt-6-astra", ""); err == nil {
+			t.Error("resolveModel(gpt-6-astra) succeeded, want a rejection naming the live models")
+		} else if !strings.Contains(err.Error(), "gpt-5.6-sol") {
+			t.Errorf("rejection %q does not list the available models", err)
+		}
+	})
+}
+
+// An operator listing a model explicitly keeps working even if the upstream
+// flag does not mention it.
+func TestResolveModelKeepsConfiguredNames(t *testing.T) {
+	client, err := newPrismClient(&storedAuth{Cookies: "c=1"})
+	if err != nil {
+		t.Fatalf("newPrismClient: %v", err)
+	}
+	withCatalog(t, client, "gpt-5.6-sol")
+
+	cfg := defaultConfig()
+	cfg.Models = []string{"legacy-model"}
+	withConfig(t, cfg, func() {
+		got, err := resolveModel(context.Background(), client, "legacy-model", "")
+		if err != nil || got != "legacy-model" {
+			t.Errorf("resolveModel(legacy-model) = %q, %v; want legacy-model", got, err)
+		}
+	})
+}
+
+// failingTransport makes a catalog lookup fail the same way everywhere: on a
+// machine that can reach prism the real request would otherwise succeed and the
+// test would assert different things in CI than on a developer's box.
+type failingTransport struct{}
+
+func (failingTransport) RoundTrip(*http.Request) (*http.Response, error) {
+	return nil, errors.New("网络在测试里不可用")
+}
+
+// Without a catalog the requested name is passed through: a failed lookup must
+// not break a setup that was working.
+func TestResolveModelWithoutCatalogPassesThrough(t *testing.T) {
+	client, err := newPrismClient(&storedAuth{Cookies: "c=1"})
+	if err != nil {
+		t.Fatalf("newPrismClient: %v", err)
+	}
+	client.http = &http.Client{Transport: failingTransport{}}
+
+	cfg := defaultConfig()
+	cfg.Models = nil
+	withConfig(t, cfg, func() {
+		got, err := resolveModel(context.Background(), client, "whatever", "")
+		if err != nil || got != "whatever" {
+			t.Errorf("resolveModel(whatever) = %q, %v; want whatever", got, err)
+		}
+
+		// With no catalog at all and no request model, the compiled fallback is
+		// used rather than advertising nothing.
+		if got, err := resolveModel(context.Background(), client, "", ""); err != nil || got != fallbackModel {
+			t.Errorf("resolveModel(\"\", \"\") = %q, %v; want %q", got, err, fallbackModel)
 		}
 	})
 }
@@ -1121,6 +1222,13 @@ func TestPanelServesFormAndReportsOutcome(t *testing.T) {
 		return env.Result.StatusCode, string(env.Result.Body)
 	}
 
+	// Opening the panel is enough to get a login link: the page starts the flow
+	// itself rather than sending the operator to CPA first.
+	stub := &loginFlow{state: "prismtest", authorizeURL: "https://auth.openai.com/api/accounts/authorize?client_id=stub&state=prismtest"}
+	previousStart := startLoginFunc
+	startLoginFunc = func(context.Context) (*loginFlow, error) { return stub, nil }
+	defer func() { startLoginFunc = previousStart }()
+
 	// A plain visit renders the form.
 	// The host reaches the panel through management.handle, so that is the entry
 	// point the test exercises.
@@ -1131,6 +1239,13 @@ func TestPanelServesFormAndReportsOutcome(t *testing.T) {
 	status, page := decode(t, out)
 	if status != 200 || !strings.Contains(page, "redirect_url") || !strings.Contains(page, "完成登录") {
 		t.Fatalf("GET panel = %d, page missing the form: %s", status, page[:min(200, len(page))])
+	}
+	// The URL is rendered as an escaped link (query separators become &amp;).
+	if !strings.Contains(page, "client_id=stub") || !strings.Contains(page, `target="_blank"`) {
+		t.Fatalf("GET panel did not show the provider's authorization URL: %s", page)
+	}
+	if strings.Contains(page, "先在 CPA 里点一次登录") {
+		t.Error("panel still asks the operator to start the flow in CPA")
 	}
 
 	// A form submission reaches the completion path; with no flow in flight the

@@ -166,11 +166,19 @@ plugins:
       # Yjs socket 同步 → wait-for-sync），并按项目缓存复用，所以只有首次请求
       # 会多等几秒。默认开。
       sandbox: true
-      default_model: "gpt-6-astra"
       reasoning_effort: "medium"   # low | medium | high | xhigh
       system_prompt: ""            # 客户端没给 system 消息时用这个
-      models: ["gpt-6-astra"]
+      # default_model / models 留空 = 用 prism 自己下发的模型清单（推荐）。
+      # 只在需要固定模型时才填：
+      # default_model: "gpt-5.6-sol"
+      # models: ["gpt-5.6-sol", "gpt-5.6-terra"]
 ```
+
+> **模型清单来自上游，不要写死。** prism 没有 `/models` 端点，网页端的可选模型是一次
+> Statsig 动态配置（`prism_codex_models`，经同源 `/api/ff/initialize` 下发）。插件会带上
+> 凭据去取同一份清单并缓存 30 分钟。2026-09-17 实测：抓包里还在用的 `gpt-6-astra`
+> 隔天就被服务端以 `400 Error while processing conversation` 拒掉，线上实际可用的是
+> `gpt-5.6-sol` / `gpt-5.6-terra`——写死就会这样无声失效。
 
 > `models` 三种写法都认：单行 JSON 数组字符串（CPA 文档的写法）、真正的 YAML 列表、以及带 `id` 字段的对象数组。
 
@@ -219,7 +227,7 @@ curl -s -H "Authorization: Bearer $CPA_MGMT_KEY" \
 
 ```bash
 curl -s -H "Authorization: Bearer $CPA_KEY" http://127.0.0.1:8319/v1/models | jq
-# {"data":[{"id":"gpt-6-astra","object":"model","owned_by":"prism-provider"}, ...]}
+# {"data":[{"id":"gpt-5.6-sol","object":"model","owned_by":"prism-provider"}, ...]}
 ```
 
 真实对话：
@@ -228,7 +236,7 @@ curl -s -H "Authorization: Bearer $CPA_KEY" http://127.0.0.1:8319/v1/models | jq
 curl -s http://127.0.0.1:8319/v1/chat/completions \
   -H "Authorization: Bearer $CPA_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"model":"gpt-6-astra",
+  -d '{"model":"gpt-5.6-sol",
        "messages":[{"role":"user","content":"用一句话解释 LaTeX 的 \\label 有什么用"}]}'
 ```
 

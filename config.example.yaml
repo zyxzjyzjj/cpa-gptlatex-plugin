@@ -18,10 +18,14 @@ plugins:
       user_id: ""              # user-xxxx; probed from /auth/session when empty
       project_uuid: ""         # reuse an existing project; created once and cached when empty
       project_title: "CLIProxyAPI"
-      default_model: "gpt-6-astra"
       reasoning_effort: "medium"   # low | medium | high | xhigh
       system_prompt: ""
-      models: ["gpt-6-astra"]
+
+      # Leave both empty to use the model list prism itself publishes (it comes
+      # from a feature flag the web client reads, and it rotates — a hardcoded
+      # name stops working without warning). Fill them in only to pin models.
+      #   default_model: "gpt-5.6-sol"
+      #   models: ["gpt-5.6-sol", "gpt-5.6-terra"]
 
       # Leave this on. Without a sandbox prism answers every turn with
       # sandbox_reconnecting and never produces output; the plugin performs the

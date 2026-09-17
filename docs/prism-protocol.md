@@ -348,9 +348,54 @@ if ("error" === V.status) {
 
 ### 3.7 模型与思考档位
 
-- 模型列表：前端 `useAvailableCodexModels()`；默认项 `DEFAULT_CODEX_MODEL_OPTION`（模块 312670，字面量未在本轮读取中捕获）。
 - 思考档位（逐字）：`[{value:"low"},{value:"medium"},{value:"high"},{value:"xhigh"}]`
 - 自定义 `sandbox_url`/`sandbox_token` 由 `metadata` 透传，因此**模型名由 `metadata.model` 决定**，与 URL 无关。
+
+**✅ 2026-09-17 补齐：模型清单来自 Statsig 动态配置，不是固定值。** 之前那条"前端
+`useAvailableCodexModels()`，默认项字面量未捕获"本轮读到了完整实现（模块 312670，现网 bundle）：
+
+```js
+let n = "gpt-5.6-sol", r = {id: n, label: "5.6 Sol"};        // DEFAULT_CODEX_MODEL(_OPTION)
+let s = [r];
+function useAvailableCodexModels() {
+  let {getDynamicConfig, isLoading} = useStatsigClient(),
+      r = isLoading ? undefined : getDynamicConfig("prism_codex_models").get("models", s);
+  /* 逐项校验 {id,label} 后去重；为空则退回 s */
+}
+```
+
+即：清单 = 动态配置 `prism_codex_models` 的 `value.models`，默认项只是兜底。取法（已实测，
+带 cookie 即可，无需浏览器）：
+
+```
+POST https://prism.openai.com/api/ff/initialize?k=client-d0gSj7B2FQZm9bDlJi69cVNab4egZxnQy0TEpiQXdAP
+                                          &st=javascript-client-react&sv=3.33.1&t=<ms>&sid=<uuid>
+     content-type: application/json      // 网页端用 Statsig 自定义压缩编码，普通 JSON 同样被接受
+     body: {"user":{"userID":"<user-… 句柄>"},"hash":"djb2","delimiter":"|",
+            "clientSDKKey":"client-…","time":<ms>,"statsigMetadata":{…}}
+  → 200 {"dynamic_configs": { "62892348": {"value": {"models":[{"id":"gpt-5.6-sol","label":"5.6 Sol"},
+                                                                 {"id":"gpt-5.6-terra","label":"5.6 Terra"}],
+                                                    "free_model":"gpt-5.5","free_reasoning_effort":"high"}, …}, …}}
+```
+
+- **key 是配置名的 djb2 哈希**：`djb2("prism_codex_models") == 62892348`（复刻 Statsig JS SDK 的
+  `_getHashedName`：`h = h*31 + code`，取无符号 32 位），不是明文名。
+- `client-d0gSj7B2FQZm9bDlJi69cVNab4egZxnQy0TEpiQXdAP` 是网页端 bundle 里的**客户端 key**
+  （client key 本就随页面公开）。
+- 同一份响应里还有 `free_model` / `free_reasoning_effort`，是免费档的模型与思考档位。
+
+**⚠️ 写死模型名会无声失效。** 2026-09-16 的抓包里 `metadata.model` 是 `gpt-6-astra`
+（沙箱内 codex 的 `thread_settings_applied` 也是它），2026-09-17 再发就被服务端拒：
+
+```json
+{"status":"completed","response":{"status":"error","payload":{
+  "reason":"unknown","httpStatus":400,
+  "message":"Error while processing conversation (400 Bad Request). Please submit prompt again."}}}
+```
+
+`start` 之后同一秒就返回，`reason` 只有 `unknown`——**错误信息里完全看不出是模型名的
+问题**，盘查方向很容易跑偏。所以模型清单必须按上面的方式问上游要（插件里见
+`prism.go` 的 `fetchCatalog`/`catalogFor`，缓存 30 分钟）。
 
 ### 3.8 中断
 

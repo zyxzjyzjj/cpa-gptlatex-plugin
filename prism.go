@@ -39,6 +39,156 @@ const (
 		"(KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36 Edg/152.0.0.0"
 )
 
+// ------------------------------------------------ 上游模型清单（Statsig）
+
+// prism 没有 /models 端点：网页端的可选模型来自 Statsig 动态配置
+// `prism_codex_models`，经同源代理 /api/ff/initialize 下发（前端
+// useAvailableCodexModels()，模块 312670）。所以模型名只能问上游要——
+// 写死必然过期：gpt-6-astra 在 2026-09-16 的抓包里还是网页端在用的模型，
+// 隔天就被服务端以 HTTP 400 "Error while processing conversation
+// (400 Bad Request). Please submit prompt again." 拒掉，而线上实际可用的
+// 是 gpt-5.6-sol / gpt-5.6-terra。这里复刻网页端那次调用。
+const (
+	// statsigConfigName 是动态配置名，响应里的 key 是它的 djb2 哈希。
+	statsigConfigName = "prism_codex_models"
+	// statsigSDKKey 是网页端 bundle 里的客户端 key（client key 本就是公开值，
+	// 浏览器端人人可见）。
+	statsigSDKKey  = "client-d0gSj7B2FQZm9bDlJi69cVNab4egZxnQy0TEpiQXdAP"
+	statsigSDKType = "javascript-client-react"
+	statsigSDKVer  = "3.33.1"
+	// catalogTTL 决定多久回上游刷新一次模型清单。
+	catalogTTL = 30 * time.Minute
+	// catalogTimeout 限制刷新时长：拿不到就退回配置里的清单，不能拖垮请求。
+	catalogTimeout = 10 * time.Second
+)
+
+// modelOption 是清单里的一项，字段名与上游一致。
+type modelOption struct {
+	ID    string `json:"id"`
+	Label string `json:"label"`
+}
+
+// modelCatalog 是上游当前提供的模型。
+type modelCatalog struct {
+	Models []modelOption
+	// FreeModel/FreeEffort 来自同一份配置，供日志与排障参考。
+	FreeModel  string
+	FreeEffort string
+	fetchedAt  time.Time
+}
+
+var (
+	catalogMu    sync.Mutex
+	catalogCache = map[string]*modelCatalog{}
+)
+
+// statsigConfigID 复刻 Statsig JS SDK 的 _getHashedName：djb2 后取无符号
+// 32 位十进制字符串。校验过 djb2("prism_codex_models") == "62892348"。
+func statsigConfigID(name string) string {
+	var hash uint32
+	for _, r := range name {
+		hash = hash*31 + uint32(r)
+	}
+	return fmt.Sprintf("%d", hash)
+}
+
+// fetchCatalog asks prism for the model list the web client would see.
+func (c *prismClient) fetchCatalog(ctx context.Context) (*modelCatalog, error) {
+	now := time.Now()
+	body := map[string]any{
+		"user":         map[string]any{"userID": c.userID, "customIDs": map[string]any{}},
+		"hash":         "djb2",
+		"delimiter":    "|",
+		"clientSDKKey": statsigSDKKey,
+		"time":         now.UnixMilli(),
+		"statsigMetadata": map[string]any{
+			"sdkType": statsigSDKType, "sdkVersion": statsigSDKVer,
+			"sessionID": c.credKey, "stableID": c.credKey,
+		},
+	}
+	path := fmt.Sprintf("/api/ff/initialize?k=%s&st=%s&sv=%s&t=%d&sid=%s",
+		url.QueryEscape(statsigSDKKey), statsigSDKType, statsigSDKVer, now.UnixMilli(), url.QueryEscape(c.credKey))
+
+	var out struct {
+		DynamicConfigs map[string]struct {
+			Value struct {
+				Models     []modelOption `json:"models"`
+				FreeModel  string        `json:"free_model"`
+				FreeEffort string        `json:"free_reasoning_effort"`
+			} `json:"value"`
+		} `json:"dynamic_configs"`
+	}
+	if err := c.do(ctx, http.MethodPost, path, body, &out); err != nil {
+		return nil, err
+	}
+	entry, ok := out.DynamicConfigs[statsigConfigID(statsigConfigName)]
+	if !ok {
+		return nil, fmt.Errorf("上游 flags 里没有 %s（%s）", statsigConfigName, statsigConfigID(statsigConfigName))
+	}
+	catalog := &modelCatalog{
+		FreeModel:  entry.Value.FreeModel,
+		FreeEffort: entry.Value.FreeEffort,
+		fetchedAt:  time.Now(),
+	}
+	for _, m := range entry.Value.Models {
+		if strings.TrimSpace(m.ID) != "" {
+			catalog.Models = append(catalog.Models, m)
+		}
+	}
+	if len(catalog.Models) == 0 {
+		return nil, fmt.Errorf("上游 %s 没有可用模型", statsigConfigName)
+	}
+	return catalog, nil
+}
+
+// catalogFor returns the model list for a credential, refreshing it at most
+// every catalogTTL. A refresh failure falls back to the last good answer, and
+// an empty cache is reported as an error so callers can use their configured
+// list instead.
+func (c *prismClient) catalogFor(ctx context.Context) (*modelCatalog, error) {
+	catalogMu.Lock()
+	cached := catalogCache[c.credKey]
+	catalogMu.Unlock()
+	if cached != nil && time.Since(cached.fetchedAt) < catalogTTL {
+		return cached, nil
+	}
+
+	refreshCtx, cancel := context.WithTimeout(ctx, catalogTimeout)
+	defer cancel()
+	catalog, err := c.fetchCatalog(refreshCtx)
+	if err != nil {
+		if cached != nil {
+			hostLog("warn", "刷新 prism 模型清单失败，沿用上一次结果", map[string]any{
+				"error": err.Error(),
+			})
+			return cached, nil
+		}
+		return nil, err
+	}
+	catalogMu.Lock()
+	catalogCache[c.credKey] = catalog
+	catalogMu.Unlock()
+	ids := make([]string, 0, len(catalog.Models))
+	for _, m := range catalog.Models {
+		ids = append(ids, m.ID)
+	}
+	hostLog("info", "已获取 prism 模型清单", map[string]any{
+		"models": strings.Join(ids, ","), "free_model": catalog.FreeModel,
+	})
+	return catalog, nil
+}
+
+// defaultCatalog narrows the fallback error path: if any credential has ever
+// been seen, its list is better than a compiled-in name.
+func defaultCatalog() *modelCatalog {
+	catalogMu.Lock()
+	defer catalogMu.Unlock()
+	for _, catalog := range catalogCache {
+		return catalog
+	}
+	return nil
+}
+
 type prismClient struct {
 	http      *http.Client
 	cookies   string
@@ -225,6 +375,10 @@ func terminalTurnError(resp *turnResponse) *prismError {
 		if message == "" {
 			message = "prism 返回 " + resp.Status
 		}
+		hostLog("error", "prism 回合终止", map[string]any{
+			"status":  resp.Status,
+			"message": message,
+		})
 		return &prismError{Status: status, Reason: resp.Status, Message: message}
 	}
 	return nil
@@ -244,6 +398,11 @@ type turnPayload struct {
 	Output         []outputItem `json:"output"`
 	ID             string       `json:"id"`
 	ConversationID string       `json:"conversationId"`
+	// CodexRequestDebug is the server's own account of the turn: which sandbox
+	// URL it resolved, which exec endpoint it called, whether it saw a listen
+	// snapshot. It is the only way to tell a bad model name from a sandbox that
+	// was never handed over, so it is kept and logged rather than dropped.
+	CodexRequestDebug json.RawMessage `json:"codexRequestDebug"`
 }
 
 type outputItem struct {
@@ -318,6 +477,11 @@ func (c *prismClient) startTurn(ctx context.Context, body turnRequest) (*turnRes
 	if pe := terminalTurnError(&out); pe != nil {
 		return nil, pe
 	}
+	hostLog("info", "prism 回合已提交", map[string]any{
+		"status":         out.Status,
+		"request_id":     out.RequestID,
+		"has_turn_state": len(out.TurnState) > 0,
+	})
 	if strings.TrimSpace(out.RequestID) == "" {
 		return nil, fmt.Errorf("response_with_tools_start 未返回 request_id")
 	}
@@ -403,12 +567,17 @@ func interpret(res *turnResult) (*turnPayload, error) {
 		return &res.Payload, nil
 	}
 	if sameReason(res.Payload.Reason, reasonSandboxReconnecting) {
+		hostLog("warn", "prism 沙箱重连中，本轮将重试", map[string]any{
+			"reason":  res.Payload.Reason,
+			"message": res.Payload.Message,
+		})
 		return nil, errSandboxReconnecting
 	}
 	msg := res.Payload.Message
 	if msg == "" {
 		msg = res.Payload.Reason
 	}
+	hostLog("error", "prism 本轮失败", turnErrorFields(&res.Payload))
 	return nil, &prismError{
 		Status:     res.Payload.HTTPStatus,
 		Reason:     res.Payload.Reason,
@@ -416,6 +585,30 @@ func interpret(res *turnResult) (*turnPayload, error) {
 		RootCause:  res.Payload.RootCause,
 		MessageKey: res.Payload.MessageKey,
 	}
+}
+
+// turnErrorFields renders prism's failure payload for the host log. `reason`
+// and `messageKey` name the condition; codexRequestDebug is the server's own
+// account of the turn (the sandbox URL it resolved, the exec endpoint it
+// called, whether it saw a sandbox token at all), which is what separates a
+// rejected model name from a sandbox that never arrived.
+func turnErrorFields(p *turnPayload) map[string]any {
+	fields := map[string]any{
+		"reason":       p.Reason,
+		"message":      p.Message,
+		"message_key":  p.MessageKey,
+		"root_cause":   p.RootCause,
+		"http_status":  p.HTTPStatus,
+		"conversation": p.ConversationID,
+	}
+	if len(p.CodexRequestDebug) > 0 {
+		debug := string(p.CodexRequestDebug)
+		if len(debug) > 1500 {
+			debug = debug[:1500] + "…"
+		}
+		fields["codex_request_debug"] = debug
+	}
+	return fields
 }
 
 var errSandboxReconnecting = fmt.Errorf("sandbox reconnecting")
@@ -429,10 +622,23 @@ type prismError struct {
 }
 
 func (e *prismError) Error() string {
-	if e.Message != "" {
-		return e.Message
+	message := e.Message
+	if message == "" {
+		message = e.Reason
 	}
-	return e.Reason
+	// Prism's own text is often generic ("Error while processing
+	// conversation…") while `reason`/`messageKey` name the condition, so both
+	// travel to the client. `error`/`failed` are the top-level status restated
+	// and would be noise.
+	label := strings.TrimSpace(e.Reason + " " + e.MessageKey)
+	switch {
+	case label == "", label == "error", label == "failed":
+		return message
+	case strings.Contains(message, label):
+		return message
+	default:
+		return label + ": " + message
+	}
 }
 
 // HTTPStatus maps a prism failure onto the status CPA should surface.

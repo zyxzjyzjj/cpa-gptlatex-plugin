@@ -38,15 +38,30 @@ func handleExecute(raw []byte, stream bool) ([]byte, error) {
 	if err != nil {
 		return errorEnvelope("invalid_request", err.Error(), http.StatusBadRequest), nil
 	}
-	model := resolveModel(req.Model, chat.Model)
+	model, err := resolveModel(ctx, client, req.Model, chat.Model)
+	if err != nil {
+		return errorEnvelope("invalid_request", err.Error(), http.StatusBadRequest), nil
+	}
 
 	input, err := buildInput(chat.Messages)
 	if err != nil {
 		return errorEnvelope("invalid_request", err.Error(), http.StatusBadRequest), nil
 	}
 
+	// The host log is the only place an operator can see which model prism was
+	// actually asked for; the client-facing error cannot say it.
+	started := time.Now()
+	hostLog("info", "开始 prism 回合", map[string]any{
+		"model":         model,
+		"messages":      len(chat.Messages),
+		"input_items":   len(input),
+		"stream":        stream,
+		"request_model": req.Model,
+	})
+
 	projectID, err := client.ensureProject(ctx)
 	if err != nil {
+		hostLog("error", "创建/复用 prism 项目失败", map[string]any{"error": err.Error()})
 		return errorEnvelope("server_error", err.Error(), http.StatusBadGateway), nil
 	}
 
@@ -63,16 +78,39 @@ func handleExecute(raw []byte, stream bool) ([]byte, error) {
 	if cfg.EnableSandbox {
 		sb, sbErr := client.ensureSandbox(ctx, projectID)
 		if sbErr != nil {
+			hostLog("error", "prism 沙箱领取失败", map[string]any{
+				"project": projectID,
+				"error":   sbErr.Error(),
+			})
 			return errorEnvelope("upstream_error", sbErr.Error(), http.StatusBadGateway), nil
 		}
 		metadata["sandbox_url"] = sb.URL
 		metadata["sandbox_token"] = sb.Token
+		hostLog("info", "prism 沙箱就绪", map[string]any{
+			"project":    projectID,
+			"url":        sb.URL,
+			"elapsed_ms": time.Since(started).Milliseconds(),
+		})
 	}
 
 	turn := turnRequest{Input: input, Metadata: metadata}
 
 	payload, err := client.runTurn(ctx, turn, 5*time.Second, nil)
 	if err != nil {
+		fields := map[string]any{
+			"model":      model,
+			"project":    projectID,
+			"elapsed_ms": time.Since(started).Milliseconds(),
+			"error":      err.Error(),
+		}
+		if pErr, ok := err.(*prismError); ok {
+			fields["reason"] = pErr.Reason
+			fields["message_key"] = pErr.MessageKey
+			fields["root_cause"] = pErr.RootCause
+			fields["upstream_status"] = pErr.Status
+		}
+		hostLog("error", "prism 回合失败", fields)
+
 		// 传输层/沙箱类失败（而非服务端明确返回的业务错误）说明缓存的沙箱不可用，
 		// 丢掉它，下次请求重新领取。
 		if cfg.EnableSandbox {
@@ -90,6 +128,14 @@ func handleExecute(raw []byte, stream bool) ([]byte, error) {
 	if strings.TrimSpace(text) == "" {
 		text = "（prism 未返回可显示的文本）"
 	}
+
+	hostLog("info", "prism 回合完成", map[string]any{
+		"model":       model,
+		"project":     projectID,
+		"response_id": payload.ID,
+		"chars":       len(text),
+		"elapsed_ms":  time.Since(started).Milliseconds(),
+	})
 
 	// Framing follows the RPC method, not the client's "stream" flag: the host
 	// dispatched on the method and will decode exactly one of the two shapes.
@@ -257,25 +303,70 @@ func buildInput(messages []chatMessage) ([]map[string]any, error) {
 	return out, nil
 }
 
-func resolveModel(requested, bodyModel string) string {
+// resolveModel picks the model for this turn and refuses names prism does not
+// offer. Without that check a stale name reaches the upstream agent, which
+// answers with an opaque "Error while processing conversation (400 Bad
+// Request)" instead of naming the model as the problem.
+//
+// When the upstream list cannot be fetched the requested name is passed through
+// unchanged: a lookup failure must not break a setup that works.
+func resolveModel(ctx context.Context, client *prismClient, requested, bodyModel string) (string, error) {
 	cfg := currentConfig()
+	name := ""
 	for _, candidate := range []string{requested, bodyModel} {
 		c := strings.TrimSpace(candidate)
 		if c == "" {
 			continue
 		}
-		// Strip a provider prefix such as "prism-provider/gpt-6-astra".
+		// Strip a provider prefix such as "prism-provider/gpt-5.6-sol".
 		if i := strings.LastIndex(c, "/"); i >= 0 {
 			c = c[i+1:]
 		}
-		for _, known := range cfg.Models {
-			if strings.EqualFold(known, c) {
-				return known
-			}
-		}
-		return c
+		name = c
+		break
 	}
-	return cfg.DefaultModel
+
+	catalog, _ := client.catalogFor(ctx)
+	if name != "" {
+		if catalog == nil || knownModel(catalog, cfg.Models, name) {
+			return name, nil
+		}
+		return "", fmt.Errorf("prism 当前不提供模型 %q，可用：%s（模型清单由上游下发，可在插件配置 models 里覆盖）",
+			name, strings.Join(catalogIDs(catalog), "、"))
+	}
+	if cfg.DefaultModel != "" && (catalog == nil || knownModel(catalog, cfg.Models, cfg.DefaultModel)) {
+		return cfg.DefaultModel, nil
+	}
+	if catalog != nil {
+		// The web client's own default is the first entry of the list.
+		return catalog.Models[0].ID, nil
+	}
+	if cfg.DefaultModel != "" {
+		return cfg.DefaultModel, nil
+	}
+	return fallbackModel, nil
+}
+
+func knownModel(catalog *modelCatalog, configured []string, name string) bool {
+	for _, m := range catalog.Models {
+		if strings.EqualFold(m.ID, name) {
+			return true
+		}
+	}
+	for _, m := range configured {
+		if strings.EqualFold(m, name) {
+			return true
+		}
+	}
+	return false
+}
+
+func catalogIDs(catalog *modelCatalog) []string {
+	ids := make([]string, 0, len(catalog.Models))
+	for _, m := range catalog.Models {
+		ids = append(ids, m.ID)
+	}
+	return ids
 }
 
 // ------------------------------------------------------------- responses

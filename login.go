@@ -94,6 +94,10 @@ func parseCookieHeader(header string) []*http.Cookie {
 	return out
 }
 
+// startLoginFunc is the seam the panel goes through, so its test can render a
+// login link without a round trip to prism.
+var startLoginFunc = startLogin
+
 // startLogin begins a sign-in and returns the flow, including the URL the
 // operator has to open.
 func startLogin(ctx context.Context) (*loginFlow, error) {
