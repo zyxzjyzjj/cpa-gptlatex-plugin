@@ -90,7 +90,7 @@ const (
 
 // version is a var, not a const, so the build scripts can inject it with
 // -ldflags "-X main.version=...".
-var version = "0.2.3"
+var version = "0.2.4"
 
 // ABI and protocol versions, mirrored from CPA's sdk/pluginabi rather than
 // imported so the plugin builds against no CLIProxyAPI release in particular.

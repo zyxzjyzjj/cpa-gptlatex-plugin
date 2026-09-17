@@ -1020,14 +1020,24 @@ func (c *prismClient) doRequest(ctx context.Context, method, target string, body
 		// markup is hundreds of bytes of noise that buries the one fact the
 		// operator needs, so name the cause instead of forwarding it verbatim.
 		//
-		// Measured 2026-09-17: this page means the *egress IP* is flagged, not
+		// Measured 2026-09-17: the 403 page means the *egress IP* is flagged, not
 		// that the cookie is bad. The identical request through a US exit
-		// returned 200 while the direct one got this 403, so routing the
-		// process through a proxy is the fix; adding cf_clearance is not.
+		// returned 200 while the direct one got this 403, so routing the process
+		// through a proxy is the fix; adding cf_clearance is not.
+		//
+		// The same edge also renders the origin's own 5xx as a Cloudflare page,
+		// and those say the opposite thing — the origin did not answer. Blaming
+		// the IP for one of those sent the operator off in the wrong direction
+		// (measured while prism's project backend was returning 500/503/504 in
+		// bursts and a plain curl of the same URL answered 200 in 0.3s).
 		if isCloudflareChallenge(raw) {
-			return fmt.Errorf("prism %s 被 Cloudflare 拦截 (HTTP %d)：出口 IP 被判定为异常流量。"+
-				"实测同一请求经美国出口即 200，与 cookie 无关——请给 CPA 进程设置 HTTPS_PROXY 走代理"+
-				"（插件使用 Go 默认 transport，会自动读取该环境变量）", target, resp.StatusCode)
+			if resp.StatusCode == http.StatusForbidden {
+				return fmt.Errorf("prism %s 被 Cloudflare 拦截 (HTTP 403)：出口 IP 被判定为异常流量。"+
+					"实测同一请求经美国出口即 200，与 cookie 无关——请给 CPA 进程设置 HTTPS_PROXY 走代理"+
+					"（插件使用 Go 默认 transport，会自动读取该环境变量）", target)
+			}
+			return fmt.Errorf("prism %s 返回 %d：Cloudflare 边缘没能连上 prism 源站（上游故障，"+
+				"等一会儿重试即可；与 cookie、出口 IP 无关）", target, resp.StatusCode)
 		}
 		msg := strings.TrimSpace(string(raw))
 		if len(msg) > 400 {

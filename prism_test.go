@@ -381,6 +381,48 @@ func TestResolveModelWithoutCatalogPassesThrough(t *testing.T) {
 	})
 }
 
+// A Cloudflare page can mean two opposite things, and the message has to say
+// which: 403 is this client being flagged, 5xx is prism's origin not answering.
+func TestCloudflareErrorsAreReportedByCause(t *testing.T) {
+	const blockPage = `<!DOCTYPE html><html><head><title>Attention Required! | Cloudflare</title>` +
+		`</head><body><h1>Sorry, you have been blocked</h1><p>Cloudflare Ray ID</p></body></html>`
+
+	cases := []struct {
+		status int
+		want   string
+		absent string
+	}{
+		{http.StatusForbidden, "出口 IP 被判定为异常流量", "源站"},
+		{http.StatusGatewayTimeout, "源站", "异常流量"},
+		{http.StatusServiceUnavailable, "源站", "异常流量"},
+	}
+	for _, c := range cases {
+		t.Run(strconv.Itoa(c.status), func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(c.status)
+				_, _ = w.Write([]byte(blockPage))
+			}))
+			defer server.Close()
+			withBaseURL(t, server.URL)
+
+			client, err := newPrismClient(&storedAuth{Cookies: "c=1"})
+			if err != nil {
+				t.Fatalf("newPrismClient: %v", err)
+			}
+			err = client.do(context.Background(), http.MethodGet, "/auth/session", nil, nil)
+			if err == nil {
+				t.Fatal("expected an error")
+			}
+			if !strings.Contains(err.Error(), c.want) {
+				t.Errorf("error %q does not mention %q", err, c.want)
+			}
+			if strings.Contains(err.Error(), c.absent) {
+				t.Errorf("error %q wrongly mentions %q", err, c.absent)
+			}
+		})
+	}
+}
+
 // prism creates a project per call unless one is reused, and the in-memory
 // cache does not survive a restart, so ensureProject has to find its own work.
 func TestEnsureProjectReusesOwnProject(t *testing.T) {
