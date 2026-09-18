@@ -218,6 +218,138 @@ func TestBuildInputFlattensMultimodalContent(t *testing.T) {
 	})
 }
 
+func TestBuildInputDropsEmptyStructuralMessages(t *testing.T) {
+	withConfig(t, defaultConfig(), func() {
+		input, err := buildInput([]chatMessage{
+			{Role: "assistant", Content: json.RawMessage(`[]`)},
+			{Role: "tool", Content: json.RawMessage(`null`)},
+			{Role: "user", Content: json.RawMessage(`"real text"`)},
+			{Role: "unknown", Content: json.RawMessage(`"must not leak"`)},
+		})
+		if err != nil {
+			t.Fatalf("buildInput: %v", err)
+		}
+		if len(input) != 2 {
+			t.Fatalf("len(input) = %d, want injected system + one real text message", len(input))
+		}
+		if got := input[1]["content"].([]map[string]any)[0]["text"]; got != "real text" {
+			t.Errorf("user text = %v", got)
+		}
+	})
+}
+
+func TestDecodeResponsesRequestKeepsTextAndDropsReplayArtifacts(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.6-sol","stream":true,"instructions":"system rule",
+		"input":[
+			{"type":"reasoning","encrypted_content":"secret","summary":[]},
+			{"type":"custom_tool_call","name":"shell","input":"do work"},
+			{"type":"custom_tool_call_output","output":"large tool output"},
+			{"type":"message","role":"developer","content":[{"type":"input_text","text":"developer text"}]},
+			{"type":"message","role":"assistant","content":[{"type":"output_text","text":"earlier answer"}]},
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"current question"}]}
+		]}`)
+	req, err := decodeResponsesRequest(raw)
+	if err != nil {
+		t.Fatalf("decodeResponsesRequest: %v", err)
+	}
+	if req.Model != "gpt-5.6-sol" || !req.Stream {
+		t.Fatalf("metadata = %#v", req)
+	}
+	if len(req.Messages) != 4 { // instructions + developer + assistant + user
+		t.Fatalf("message count = %d, want 4", len(req.Messages))
+	}
+	var combined strings.Builder
+	for _, message := range req.Messages {
+		combined.WriteString(flattenContent(message.Content))
+	}
+	text := combined.String()
+	for _, absent := range []string{"secret", "do work", "large tool output"} {
+		if strings.Contains(text, absent) {
+			t.Errorf("replay artifact %q leaked into text", absent)
+		}
+	}
+	for _, want := range []string{"system rule", "developer text", "earlier answer", "current question"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("missing %q", want)
+		}
+	}
+}
+
+func TestResponsesOutputNeverContainsChatChoices(t *testing.T) {
+	raw := responsesCompletion("gpt-5.6-sol", "resp_x", "hello")
+	if bytes.Contains(raw, []byte(`"choices"`)) || !bytes.Contains(raw, []byte(`"object":"response"`)) {
+		t.Fatalf("native Responses payload is wrong: %s", raw)
+	}
+	chunks := responsesSSEChunks("gpt-5.6-sol", "resp_x", "hello")
+	if len(chunks) == 0 {
+		t.Fatal("no Responses chunks")
+	}
+	for _, chunk := range chunks {
+		if bytes.Contains(chunk.Payload, []byte(`"choices"`)) {
+			t.Fatalf("Responses chunk leaked Chat choices: %s", chunk.Payload)
+		}
+		if !bytes.Contains(chunk.Payload, []byte("event: response.")) {
+			t.Fatalf("Responses chunk has no event frame: %s", chunk.Payload)
+		}
+	}
+}
+
+func TestResponsesStartedFrameCommitsValidEvents(t *testing.T) {
+	frame := responsesStartedFrame("gpt-5.6-sol", "request-1", 123)
+	if !bytes.Contains(frame, []byte("event: response.created\n")) ||
+		!bytes.Contains(frame, []byte("event: response.in_progress\n")) {
+		t.Fatalf("started frame = %q", frame)
+	}
+	for _, block := range bytes.Split(bytes.TrimSpace(frame), []byte("\n\n")) {
+		var data []byte
+		for _, line := range bytes.Split(block, []byte("\n")) {
+			if bytes.HasPrefix(line, []byte("data: ")) {
+				data = line[len("data: "):]
+			}
+		}
+		if !json.Valid(data) {
+			t.Fatalf("invalid JSON data in frame %q", block)
+		}
+	}
+}
+
+func TestSharedExecutionRunsIdenticalWorkOnce(t *testing.T) {
+	executionMu.Lock()
+	previous := executionCache
+	executionCache = map[string]*sharedExecution{}
+	executionMu.Unlock()
+	t.Cleanup(func() {
+		executionMu.Lock()
+		executionCache = previous
+		executionMu.Unlock()
+	})
+
+	var mu sync.Mutex
+	runs := 0
+	run := func() []byte {
+		mu.Lock()
+		runs++
+		mu.Unlock()
+		time.Sleep(20 * time.Millisecond)
+		return []byte("done")
+	}
+	first := getSharedExecution("same-turn", run)
+	second := getSharedExecution("same-turn", run)
+	if first != second {
+		t.Fatal("identical turn did not share the in-flight execution")
+	}
+	<-first.done
+	mu.Lock()
+	defer mu.Unlock()
+	if runs != 1 {
+		t.Fatalf("run count = %d, want 1", runs)
+	}
+	if string(first.result) != "done" {
+		t.Fatalf("result = %q", first.result)
+	}
+}
+
 func TestBuildInputRejectsOversizedHistory(t *testing.T) {
 	withConfig(t, defaultConfig(), func() {
 		huge := strings.Repeat("x", maxInputBytes+1)

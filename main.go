@@ -90,7 +90,7 @@ const (
 
 // version is a var, not a const, so the build scripts can inject it with
 // -ldflags "-X main.version=...".
-var version = "0.2.9"
+var version = "0.3.0"
 
 // ABI and protocol versions, mirrored from CPA's sdk/pluginabi rather than
 // imported so the plugin builds against no CLIProxyAPI release in particular.
@@ -130,7 +130,9 @@ const (
 	methodManagementHandle   = "management.handle"
 	methodManagementResource = "management.resource"
 
-	methodHostLog = "host.log"
+	methodHostLog         = "host.log"
+	methodHostStreamEmit  = "host.stream.emit"
+	methodHostStreamClose = "host.stream.close"
 	// Ask the host to persist a credential. Needed on the panel path, which has
 	// no auth.parse return value to hand it back through.
 	methodHostAuthSave = "host.auth.save"
@@ -323,6 +325,19 @@ type streamChunk struct {
 	Payload []byte `json:"Payload,omitempty"`
 }
 
+// host stream bridge callback requests. []byte is base64-encoded by JSON, which
+// is exactly what the host's rpcStreamEmitRequest expects.
+type hostStreamEmitRequest struct {
+	StreamID string `json:"stream_id"`
+	Payload  []byte `json:"payload,omitempty"`
+	Error    string `json:"error,omitempty"`
+}
+
+type hostStreamCloseRequest struct {
+	StreamID string `json:"stream_id"`
+	Error    string `json:"error,omitempty"`
+}
+
 // countTokensBody is the decoder the host applies to executor.count_tokens
 // Payload. Shape taken from CPA's own reference executor plugin.
 type countTokensBody struct {
@@ -508,9 +523,12 @@ func reg() registration {
 			AuthProvider:  true,
 			Executor:      true,
 			// prism 的模型只能挂在导入的 cookie 凭据上（model.for_auth）。
-			ExecutorModelScope:    "oauth",
-			ExecutorInputFormats:  []string{"chat-completions"},
-			ExecutorOutputFormats: []string{"chat-completions"},
+			ExecutorModelScope: "oauth",
+			// Responses is native in both directions: the plugin keeps textual
+			// messages and skips replay-only reasoning/tool structures instead of
+			// asking CPA to expand 500+ input items into hundreds of chat messages.
+			ExecutorInputFormats:  []string{"responses", "chat-completions"},
+			ExecutorOutputFormats: []string{"responses", "chat-completions"},
 			// Exposes the plugin's own sign-in completion endpoint. The host's
 			// own callback box cannot be used because prism's OAuth state (~484
 			// chars) is far longer than the host's 128-character limit, so it

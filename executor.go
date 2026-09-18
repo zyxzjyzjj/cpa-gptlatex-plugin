@@ -2,17 +2,38 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 )
 
 // handleExecute services executor.execute / executor.execute_stream. Prism has
-// no upstream SSE: a turn is start + poll, so both entry points collect the
-// full answer and only differ in how it is framed for the client.
+// no upstream SSE: a turn is start + poll. A streaming call uses CPA's async
+// stream bridge so a valid first event is returned immediately instead of
+// making Codex wait 30+ seconds with no bytes and retry the same turn.
 func handleExecute(raw []byte, stream bool) ([]byte, error) {
+	if !stream {
+		return handleExecuteSync(raw, false)
+	}
+	var req executorRequest
+	if err := json.Unmarshal(raw, &req); err != nil {
+		return errorEnvelope("invalid_request", "无法解析 executor 请求: "+err.Error(), http.StatusBadRequest), nil
+	}
+	if strings.TrimSpace(req.StreamID) == "" {
+		// Compatibility fallback for older hosts/harnesses without the bridge.
+		return handleExecuteSync(raw, true)
+	}
+	return startAsyncExecute(raw, req)
+}
+
+// handleExecuteSync is the complete turn implementation shared by ordinary
+// calls and the background worker behind async streaming.
+func handleExecuteSync(raw []byte, stream bool) ([]byte, error) {
 	var req executorRequest
 	if err := json.Unmarshal(raw, &req); err != nil {
 		return errorEnvelope("invalid_request", "无法解析 executor 请求: "+err.Error(), http.StatusBadRequest), nil
@@ -34,7 +55,12 @@ func handleExecute(raw []byte, stream bool) ([]byte, error) {
 		return errorEnvelope("authentication_error", err.Error(), http.StatusUnauthorized), nil
 	}
 
-	chat, err := decodeChatRequest(req.Payload)
+	var chat *chatRequest
+	if isResponsesFormat(req.Format) {
+		chat, err = decodeResponsesRequest(req.Payload)
+	} else {
+		chat, err = decodeChatRequest(req.Payload)
+	}
 	if err != nil {
 		return errorEnvelope("invalid_request", err.Error(), http.StatusBadRequest), nil
 	}
@@ -153,21 +179,221 @@ func handleExecute(raw []byte, stream bool) ([]byte, error) {
 		"model": model,
 	})
 
-	// Framing follows the RPC method, not the client's "stream" flag: the host
-	// dispatched on the method and will decode exactly one of the two shapes.
+	outputID := payload.ID
+	if value, ok := req.Metadata["prism_output_id"].(string); ok && strings.TrimSpace(value) != "" {
+		outputID = value
+	}
+	if isResponsesFormat(req.Format) {
+		if stream {
+			chunks := responsesSSEChunks(model, outputID, text)
+			started, _ := req.Metadata["prism_started_emitted"].(bool)
+			if !started {
+				created := time.Now().Unix()
+				chunks = append([]streamChunk{{Payload: responsesStartedFrame(model, outputID, created)}}, chunks...)
+			}
+			return okEnvelope(streamResponse{
+				Headers: http.Header{
+					"Content-Type":  []string{"text/event-stream"},
+					"Cache-Control": []string{"no-cache"},
+				},
+				Chunks: chunks,
+			})
+		}
+		return okEnvelope(executorResponse{
+			Payload: responsesCompletion(model, outputID, text),
+			Headers: http.Header{"Content-Type": []string{"application/json"}},
+		})
+	}
+
+	// Chat Completions stays available for /v1/chat/completions clients.
 	if stream {
 		return okEnvelope(streamResponse{
 			Headers: http.Header{
 				"Content-Type":  []string{"text/event-stream"},
 				"Cache-Control": []string{"no-cache"},
 			},
-			Chunks: sseChunks(model, payload.ID, text),
+			Chunks: sseChunks(model, outputID, text),
 		})
 	}
 	return okEnvelope(executorResponse{
-		Payload: completion(model, payload.ID, text),
+		Payload: completion(model, outputID, text),
 		Headers: http.Header{"Content-Type": []string{"application/json"}},
 	})
+}
+
+// sharedExecution is one upstream turn shared by identical downstream retries.
+// Codex retries after a 30s idle wait; without this, four byte-identical 1.5MB
+// requests observed in production started four separate prism turns.
+type sharedExecution struct {
+	done   chan struct{}
+	result []byte
+}
+
+var (
+	executionMu    sync.Mutex
+	executionCache = map[string]*sharedExecution{}
+)
+
+func getSharedExecution(key string, run func() []byte) *sharedExecution {
+	executionMu.Lock()
+	if existing := executionCache[key]; existing != nil {
+		executionMu.Unlock()
+		return existing
+	}
+	entry := &sharedExecution{done: make(chan struct{})}
+	executionCache[key] = entry
+	executionMu.Unlock()
+	go func() {
+		entry.result = run()
+		close(entry.done)
+		// Keep the completed result briefly so an immediate retry receives the
+		// same answer rather than starting another turn.
+		time.AfterFunc(2*time.Minute, func() {
+			executionMu.Lock()
+			if executionCache[key] == entry {
+				delete(executionCache, key)
+			}
+			executionMu.Unlock()
+		})
+	}()
+	return entry
+}
+
+// startAsyncExecute emits one valid logical event immediately, which commits
+// the HTTP response before Codex's ~30s idle deadline. Work continues in the
+// background; keepalives every 10s keep the connection active.
+func startAsyncExecute(raw []byte, req executorRequest) ([]byte, error) {
+	streamID := strings.TrimSpace(req.StreamID)
+	model := requestedModelName(req.Model)
+	id := "prism-" + streamRequestID(req)
+	created := time.Now().Unix()
+	responsesOutput := isResponsesFormat(req.Format)
+
+	var first []byte
+	if responsesOutput {
+		first = responsesStartedFrame(model, id, created)
+	} else {
+		first = chatStreamFrame(model, id, created,
+			map[string]any{"role": "assistant", "content": ""}, nil)
+	}
+	if err := emitHostStream(streamID, first); err != nil {
+		return errorEnvelope("stream_error", "无法发送首个流事件: "+err.Error(), http.StatusBadGateway), nil
+	}
+	if req.Metadata == nil {
+		req.Metadata = map[string]any{}
+	}
+	req.Metadata["prism_output_id"] = id
+	req.Metadata["prism_started_emitted"] = true
+	workerRaw, _ := json.Marshal(req)
+
+	key := streamRequestID(req)
+	shared := getSharedExecution(key, func() []byte {
+		out, _ := handleExecuteSync(workerRaw, true)
+		return out
+	})
+
+	go func() {
+		ticker := time.NewTicker(10 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-shared.done:
+				out := shared.result
+				var env envelope
+				if err := json.Unmarshal(out, &env); err != nil {
+					closeHostStream(streamID, "无法解析插件流结果: "+err.Error())
+					return
+				}
+				if !env.OK || env.Error != nil {
+					message := "prism 执行失败"
+					if env.Error != nil && env.Error.Message != "" {
+						message = env.Error.Message
+					}
+					closeHostStream(streamID, message)
+					return
+				}
+				var response streamResponse
+				if err := json.Unmarshal(env.Result, &response); err != nil {
+					closeHostStream(streamID, "无法解析插件流数据: "+err.Error())
+					return
+				}
+				for _, chunk := range response.Chunks {
+					if err := emitHostStream(streamID, chunk.Payload); err != nil {
+						closeHostStream(streamID, err.Error())
+						return
+					}
+				}
+				closeHostStream(streamID, "")
+				return
+			case <-ticker.C:
+				var heartbeat []byte
+				if responsesOutput {
+					// SSE comments are valid and the Responses validator preserves them.
+					heartbeat = []byte(": prism keepalive\n\n")
+				} else {
+					heartbeat = chatStreamFrame(model, id, created, map[string]any{}, nil)
+				}
+				if err := emitHostStream(streamID, heartbeat); err != nil {
+					closeHostStream(streamID, err.Error())
+					return
+				}
+			}
+		}
+	}()
+
+	// Empty inline chunks keep the async bridge open (rpc_client_stream.go).
+	return okEnvelope(streamResponse{
+		Headers: http.Header{
+			"Content-Type":  []string{"text/event-stream"},
+			"Cache-Control": []string{"no-cache"},
+		},
+	})
+}
+
+func requestedModelName(raw string) string {
+	name := strings.TrimSpace(raw)
+	if i := strings.LastIndex(name, "/"); i >= 0 {
+		name = name[i+1:]
+	}
+	if name == "" {
+		return fallbackModel
+	}
+	return name
+}
+
+func streamRequestID(req executorRequest) string {
+	hash := sha256.New()
+	_, _ = hash.Write([]byte(strings.TrimSpace(req.Model)))
+	_, _ = hash.Write(req.StorageJSON)
+	_, _ = hash.Write(req.OriginalRequest)
+	_, _ = hash.Write(req.Payload)
+	// StreamID/HostCallbackID are intentionally excluded: they identify one
+	// downstream attempt, while retries of the same semantic turn must share.
+	return hex.EncodeToString(hash.Sum(nil)[:16])
+}
+
+func chatStreamFrame(model, id string, created int64, delta map[string]any, finish any) []byte {
+	choice := map[string]any{"index": 0, "delta": delta, "finish_reason": finish}
+	raw, _ := json.Marshal(map[string]any{
+		"id": "chatcmpl-" + id, "object": "chat.completion.chunk",
+		"created": created, "model": model, "choices": []map[string]any{choice},
+	})
+	return []byte("data: " + string(raw) + "\n\n")
+}
+
+func emitHostStream(streamID string, payload []byte) error {
+	raw, err := json.Marshal(hostStreamEmitRequest{StreamID: streamID, Payload: payload})
+	if err != nil {
+		return err
+	}
+	return callHostJSON(methodHostStreamEmit, raw, nil)
+}
+
+func closeHostStream(streamID, message string) {
+	raw, err := json.Marshal(hostStreamCloseRequest{StreamID: streamID, Error: message})
+	if err == nil {
+		_ = callHostJSON(methodHostStreamClose, raw, nil)
+	}
 }
 
 // handleCountTokens answers executor.count_tokens, which the host expects as a
@@ -219,6 +445,13 @@ type chatRequest struct {
 	Stream   bool          `json:"stream"`
 }
 
+type responsesRequest struct {
+	Model        string          `json:"model"`
+	Instructions string          `json:"instructions"`
+	Input        json.RawMessage `json:"input"`
+	Stream       bool            `json:"stream"`
+}
+
 type chatMessage struct {
 	Role    string          `json:"role"`
 	Content json.RawMessage `json:"content"`
@@ -230,12 +463,79 @@ func decodeChatRequest(raw []byte) (*chatRequest, error) {
 	}
 	var req chatRequest
 	if err := json.Unmarshal(raw, &req); err != nil {
-		return nil, fmt.Errorf("只支持 chat-completions 格式: %w", err)
+		return nil, fmt.Errorf("无法解析 chat-completions: %w", err)
 	}
 	if len(req.Messages) == 0 {
 		return nil, fmt.Errorf("messages 为空")
 	}
 	return &req, nil
+}
+
+// decodeResponsesRequest keeps only textual messages. Reasoning, tool calls,
+// tool outputs and additional_tools are replay artifacts for Codex; prism's
+// web turn endpoint cannot consume them, and converting them through Chat
+// Completions produced hundreds of empty/structural messages.
+func decodeResponsesRequest(raw []byte) (*chatRequest, error) {
+	if len(raw) == 0 {
+		return nil, fmt.Errorf("请求体为空")
+	}
+	var req responsesRequest
+	if err := json.Unmarshal(raw, &req); err != nil {
+		return nil, fmt.Errorf("无法解析 responses: %w", err)
+	}
+	out := &chatRequest{Model: req.Model, Stream: req.Stream}
+	seenInstructions := map[string]struct{}{}
+	appendText := func(role, text string) {
+		text = strings.TrimSpace(text)
+		if text == "" {
+			return
+		}
+		if role == "system" || role == "developer" {
+			if _, exists := seenInstructions[text]; exists {
+				return
+			}
+			seenInstructions[text] = struct{}{}
+			role = "system"
+		}
+		content, _ := json.Marshal(text)
+		out.Messages = append(out.Messages, chatMessage{Role: role, Content: content})
+	}
+	appendText("system", req.Instructions)
+
+	var inputText string
+	if json.Unmarshal(req.Input, &inputText) == nil && strings.TrimSpace(inputText) != "" {
+		appendText("user", inputText)
+		return out, nil
+	}
+	var items []struct {
+		Type    string          `json:"type"`
+		Role    string          `json:"role"`
+		Content json.RawMessage `json:"content"`
+	}
+	if err := json.Unmarshal(req.Input, &items); err != nil {
+		return nil, fmt.Errorf("responses.input 不是字符串或数组: %w", err)
+	}
+	for _, item := range items {
+		itemType := strings.TrimSpace(item.Type)
+		if itemType != "" && itemType != "message" {
+			continue
+		}
+		role := strings.TrimSpace(item.Role)
+		switch role {
+		case "system", "developer", "user", "assistant":
+		default:
+			continue
+		}
+		text := strings.TrimSpace(flattenContent(item.Content))
+		if text == "" {
+			continue
+		}
+		appendText(role, text)
+	}
+	if len(out.Messages) == 0 {
+		return nil, fmt.Errorf("responses.input 没有可发送给 prism 的文本消息")
+	}
+	return out, nil
 }
 
 // flattenContent accepts both the string form and the multimodal array form of
@@ -289,7 +589,15 @@ func buildInput(messages []chatMessage) ([]map[string]any, error) {
 	}
 
 	for _, m := range messages {
-		text := flattenContent(m.Content)
+		text := strings.TrimSpace(flattenContent(m.Content))
+		if text == "" {
+			// Responses→Chat conversion creates structural assistant/tool
+			// messages for tool calls and reasoning. Prism cannot consume those
+			// structures, and sending them as empty messages only bloats the
+			// request (535 Responses items became 378 chat messages in one live
+			// Codex turn). Keep only actual text.
+			continue
+		}
 		switch m.Role {
 		case "system":
 			out = append(out, map[string]any{
@@ -301,7 +609,7 @@ func buildInput(messages []chatMessage) ([]map[string]any, error) {
 				"type": "message", "role": "assistant",
 				"content": []map[string]any{{"type": "output_text", "text": text}},
 			})
-		default: // user, tool, developer
+		case "user", "developer", "tool":
 			out = append(out, map[string]any{
 				"type": "message", "role": "user",
 				"content": []map[string]any{{"type": "input_text", "text": text}},
@@ -386,6 +694,137 @@ func catalogIDs(catalog *modelCatalog) []string {
 }
 
 // ------------------------------------------------------------- responses
+
+func isResponsesFormat(format string) bool {
+	switch strings.ToLower(strings.TrimSpace(format)) {
+	case "responses", "openai-response", "openai-responses", "openai_responses":
+		return true
+	default:
+		return false
+	}
+}
+
+func normalizedResponseID(upstreamID string) string {
+	id := strings.TrimSpace(upstreamID)
+	if id == "" {
+		return "resp_prism"
+	}
+	if strings.HasPrefix(id, "resp_") {
+		return id
+	}
+	return "resp_" + strings.TrimPrefix(id, "chatcmpl-")
+}
+
+func responsesCompletion(model, upstreamID, text string) []byte {
+	id := normalizedResponseID(upstreamID)
+	messageID := "msg_" + id
+	body := map[string]any{
+		"id": id, "object": "response", "created_at": time.Now().Unix(),
+		"status": "completed", "background": false, "error": nil,
+		"incomplete_details": nil, "model": model,
+		"output": []map[string]any{{
+			"id": messageID, "type": "message", "status": "completed", "role": "assistant",
+			"content": []map[string]any{{
+				"type": "output_text", "annotations": []any{}, "logprobs": []any{}, "text": text,
+			}},
+		}},
+		"usage": map[string]any{
+			"input_tokens": 0, "output_tokens": 0, "total_tokens": 0,
+			"output_tokens_details": map[string]any{"reasoning_tokens": 0},
+			"input_tokens_details":  map[string]any{"cached_tokens": 0},
+		},
+	}
+	raw, _ := json.Marshal(body)
+	return raw
+}
+
+func responsesSSEEvent(event string, body map[string]any) streamChunk {
+	raw, _ := json.Marshal(body)
+	return streamChunk{Payload: []byte("event: " + event + "\ndata: " + string(raw) + "\n\n")}
+}
+
+// responsesStartedFrame is emitted before prism work starts. It is a complete
+// logical Responses event, so CPA commits headers immediately and Codex does
+// not abort/retry at ~30s.
+func responsesStartedFrame(model, upstreamID string, created int64) []byte {
+	id := normalizedResponseID(upstreamID)
+	createdBody := map[string]any{
+		"type": "response.created", "sequence_number": 1,
+		"response": map[string]any{
+			"id": id, "object": "response", "created_at": created,
+			"status": "in_progress", "background": false, "error": nil,
+			"output": []any{}, "model": model,
+		},
+	}
+	inProgress := map[string]any{
+		"type": "response.in_progress", "sequence_number": 2,
+		"response": map[string]any{
+			"id": id, "object": "response", "created_at": created,
+			"status": "in_progress", "output": []any{}, "model": model,
+		},
+	}
+	one := responsesSSEEvent("response.created", createdBody).Payload
+	two := responsesSSEEvent("response.in_progress", inProgress).Payload
+	return append(one, two...)
+}
+
+func responsesSSEChunks(model, upstreamID, text string) []streamChunk {
+	id := normalizedResponseID(upstreamID)
+	created := time.Now().Unix()
+	messageID := "msg_" + id
+	seq := 3 // 1/2 were emitted by responsesStartedFrame in async mode.
+	next := func() int { value := seq; seq++; return value }
+	itemAdded := map[string]any{
+		"type": "response.output_item.added", "sequence_number": next(), "output_index": 0,
+		"item": map[string]any{"id": messageID, "type": "message", "status": "in_progress", "content": []any{}, "role": "assistant"},
+	}
+	part := map[string]any{"type": "output_text", "annotations": []any{}, "logprobs": []any{}, "text": ""}
+	partAdded := map[string]any{
+		"type": "response.content_part.added", "sequence_number": next(),
+		"item_id": messageID, "output_index": 0, "content_index": 0, "part": part,
+	}
+	delta := map[string]any{
+		"type": "response.output_text.delta", "sequence_number": next(),
+		"item_id": messageID, "output_index": 0, "content_index": 0, "delta": text, "logprobs": []any{},
+	}
+	textDone := map[string]any{
+		"type": "response.output_text.done", "sequence_number": next(),
+		"item_id": messageID, "output_index": 0, "content_index": 0, "text": text, "logprobs": []any{},
+	}
+	finalPart := map[string]any{"type": "output_text", "annotations": []any{}, "logprobs": []any{}, "text": text}
+	partDone := map[string]any{
+		"type": "response.content_part.done", "sequence_number": next(),
+		"item_id": messageID, "output_index": 0, "content_index": 0, "part": finalPart,
+	}
+	message := map[string]any{
+		"id": messageID, "type": "message", "status": "completed", "role": "assistant",
+		"content": []map[string]any{finalPart},
+	}
+	itemDone := map[string]any{
+		"type": "response.output_item.done", "sequence_number": next(), "output_index": 0, "item": message,
+	}
+	completedResponse := map[string]any{
+		"id": id, "object": "response", "created_at": created, "status": "completed",
+		"background": false, "error": nil, "model": model, "output": []map[string]any{message},
+		"usage": map[string]any{
+			"input_tokens": 0, "output_tokens": 0, "total_tokens": 0,
+			"output_tokens_details": map[string]any{"reasoning_tokens": 0},
+			"input_tokens_details":  map[string]any{"cached_tokens": 0},
+		},
+	}
+	completed := map[string]any{
+		"type": "response.completed", "sequence_number": next(), "response": completedResponse,
+	}
+	return []streamChunk{
+		responsesSSEEvent("response.output_item.added", itemAdded),
+		responsesSSEEvent("response.content_part.added", partAdded),
+		responsesSSEEvent("response.output_text.delta", delta),
+		responsesSSEEvent("response.output_text.done", textDone),
+		responsesSSEEvent("response.content_part.done", partDone),
+		responsesSSEEvent("response.output_item.done", itemDone),
+		responsesSSEEvent("response.completed", completed),
+	}
+}
 
 func completion(model, upstreamID, text string) []byte {
 	id := upstreamID
