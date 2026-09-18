@@ -59,6 +59,8 @@ models: ["gpt-6-astra", "gpt-5-codex"]
 default_model: gpt-5-codex
 reasoning_effort: HIGH
 sandbox: true
+client_tools: false
+client_tools_max_rounds: 3
 system_prompt: "be terse"
 `)
 		if err := configure(req); err != nil {
@@ -92,6 +94,9 @@ system_prompt: "be terse"
 		}
 		if got.SystemPrompt != "be terse" {
 			t.Errorf("SystemPrompt = %q", got.SystemPrompt)
+		}
+		if got.ClientTools || got.ClientToolsMaxRounds != 3 {
+			t.Errorf("ClientTools = %v, rounds = %d", got.ClientTools, got.ClientToolsMaxRounds)
 		}
 	})
 }
@@ -238,7 +243,7 @@ func TestBuildInputDropsEmptyStructuralMessages(t *testing.T) {
 	})
 }
 
-func TestDecodeResponsesRequestKeepsTextAndDropsReplayArtifacts(t *testing.T) {
+func TestDecodeResponsesRequestKeepsTextAndToolRoundtrip(t *testing.T) {
 	raw := []byte(`{
 		"model":"gpt-5.6-sol","stream":true,"instructions":"system rule",
 		"input":[
@@ -256,20 +261,18 @@ func TestDecodeResponsesRequestKeepsTextAndDropsReplayArtifacts(t *testing.T) {
 	if req.Model != "gpt-5.6-sol" || !req.Stream {
 		t.Fatalf("metadata = %#v", req)
 	}
-	if len(req.Messages) != 4 { // instructions + developer + assistant + user
-		t.Fatalf("message count = %d, want 4", len(req.Messages))
+	if len(req.Messages) != 6 { // instructions + tool call/result + developer + assistant + user
+		t.Fatalf("message count = %d, want 6", len(req.Messages))
 	}
 	var combined strings.Builder
 	for _, message := range req.Messages {
 		combined.WriteString(flattenContent(message.Content))
 	}
 	text := combined.String()
-	for _, absent := range []string{"secret", "do work", "large tool output"} {
-		if strings.Contains(text, absent) {
-			t.Errorf("replay artifact %q leaked into text", absent)
-		}
+	if strings.Contains(text, "secret") {
+		t.Error("reasoning encrypted_content leaked into text")
 	}
-	for _, want := range []string{"system rule", "developer text", "earlier answer", "current question"} {
+	for _, want := range []string{"system rule", "do work", "large tool output", "developer text", "earlier answer", "current question"} {
 		if !strings.Contains(text, want) {
 			t.Errorf("missing %q", want)
 		}
@@ -277,11 +280,11 @@ func TestDecodeResponsesRequestKeepsTextAndDropsReplayArtifacts(t *testing.T) {
 }
 
 func TestResponsesOutputNeverContainsChatChoices(t *testing.T) {
-	raw := responsesCompletion("gpt-5.6-sol", "resp_x", "hello")
+	raw := responsesCompletion("gpt-5.6-sol", "resp_x", "hello", nil)
 	if bytes.Contains(raw, []byte(`"choices"`)) || !bytes.Contains(raw, []byte(`"object":"response"`)) {
 		t.Fatalf("native Responses payload is wrong: %s", raw)
 	}
-	chunks := responsesSSEChunks("gpt-5.6-sol", "resp_x", "hello")
+	chunks := responsesSSEChunks("gpt-5.6-sol", "resp_x", "hello", nil)
 	if len(chunks) == 0 {
 		t.Fatal("no Responses chunks")
 	}
@@ -556,10 +559,8 @@ func TestCloudflareErrorsAreReportedByCause(t *testing.T) {
 	}
 }
 
-// Creating a project is the reliable call (during prism's 2026-09-17 storage
-// incident create answered 200 while the list endpoint timed out), so a client
-// with no project uses it rather than searching first.
-func TestEnsureProjectCreatesRatherThanSearching(t *testing.T) {
+// An existing project for the current account is reused before creating one.
+func TestEnsureProjectReusesCurrentAccountProject(t *testing.T) {
 	withFreshProjectCache(t)
 
 	var listed int
@@ -586,23 +587,23 @@ func TestEnsureProjectCreatesRatherThanSearching(t *testing.T) {
 		if err != nil {
 			t.Fatalf("ensureProject: %v", err)
 		}
-		if got != "fresh" {
-			t.Errorf("project = %q, want the created project", got)
+		if got != "newest" {
+			t.Errorf("project = %q, want the existing current-account project", got)
 		}
-		if listed != 0 {
-			t.Errorf("listed projects %d times, want 0", listed)
+		if listed != 1 {
+			t.Errorf("listed projects %d times, want 1", listed)
 		}
 	})
 }
 
-// The project id travels in the credential file, so a restart does not have to
-// rediscover it -- and does not leave another project behind.
-func TestEnsureProjectUsesCredentialProjectWithoutNetwork(t *testing.T) {
+// A persisted project is reused only when it belongs to the current account.
+func TestEnsureProjectValidatesPersistedProject(t *testing.T) {
 	withFreshProjectCache(t)
-
-	var calls int
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		calls++
+		if r.URL.Path == "/api/file-management/projects" {
+			_, _ = w.Write([]byte(`{"projects":[{"uuid":"from-credential","title":"CLIProxyAPI"}]}`))
+			return
+		}
 		http.NotFound(w, r)
 	}))
 	defer server.Close()
@@ -613,24 +614,50 @@ func TestEnsureProjectUsesCredentialProjectWithoutNetwork(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newPrismClient: %v", err)
 	}
+	// Clear the eagerly copied id so ensureProject exercises validation.
+	client.projectID = ""
 	withConfig(t, defaultConfig(), func() {
 		got, err := client.ensureProject(context.Background())
 		if err != nil {
 			t.Fatalf("ensureProject: %v", err)
 		}
 		if got != "from-credential" {
-			t.Errorf("project = %q, want the one from the credential", got)
-		}
-		if calls != 0 {
-			t.Errorf("made %d requests, want 0", calls)
+			t.Errorf("project = %q", got)
 		}
 	})
 }
 
-// When creation is unavailable (prism answers 503 "Project storage is
-// temporarily unavailable" while reads keep working) any existing project beats
-// failing the turn.
-func TestEnsureProjectFallsBackWhenCreationFails(t *testing.T) {
+func TestEnsureProjectReplacesStaleConfiguredProject(t *testing.T) {
+	withFreshProjectCache(t)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/file-management/projects" {
+			_, _ = w.Write([]byte(`{"projects":[{"uuid":"current-project","title":"CLIProxyAPI"}]}`))
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer server.Close()
+	withBaseURL(t, server.URL)
+	cfg := defaultConfig()
+	cfg.ProjectUUID = "stale-project"
+	withConfig(t, cfg, func() {
+		client, err := newPrismClient(&storedAuth{Cookies: "c=1"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		client.projectID = ""
+		got, err := client.ensureProject(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != "current-project" {
+			t.Fatalf("project = %q", got)
+		}
+	})
+}
+
+// Any current-account project can be reused when no title match exists.
+func TestEnsureProjectFallsBackToAnyCurrentProject(t *testing.T) {
 	withFreshProjectCache(t)
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -715,7 +742,7 @@ func TestTurnPayloadTextSkipsNonMessageItems(t *testing.T) {
 }
 
 func TestCompletionIsValidChatCompletion(t *testing.T) {
-	raw := completion("gpt-6-astra", "resp_123", "hello")
+	raw := completion("gpt-6-astra", "resp_123", "hello", nil)
 	var body struct {
 		ID      string `json:"id"`
 		Object  string `json:"object"`
@@ -747,7 +774,7 @@ func TestCompletionIsValidChatCompletion(t *testing.T) {
 }
 
 func TestSSEChunksAreWellFormed(t *testing.T) {
-	chunks := sseChunks("gpt-6-astra", "resp_123", "hi")
+	chunks := sseChunks("gpt-6-astra", "resp_123", "hi", nil)
 	if len(chunks) != 4 {
 		t.Fatalf("len(chunks) = %d, want 4", len(chunks))
 	}
@@ -1305,7 +1332,7 @@ func TestNewCacheBustIsNumeric(t *testing.T) {
 // machine's console mangles Chinese on display, which is why this asserts bytes.)
 func TestCompletionPreservesNonASCII(t *testing.T) {
 	const answer = `LaTeX 中，\label{名称} 用于设置引用标记，\ref{名称} 用于显示编号。`
-	raw := completion("gpt-6-astra", "resp_x", answer)
+	raw := completion("gpt-6-astra", "resp_x", answer, nil)
 
 	if !utf8.Valid(raw) {
 		t.Fatal("completion produced invalid UTF-8")
@@ -1417,19 +1444,28 @@ func TestProjectCacheExpires(t *testing.T) {
 	}
 }
 
-// ensureProject must prefer an explicitly configured UUID over creating one.
-func TestEnsureProjectPrefersConfigUUID(t *testing.T) {
+// A configured UUID is preferred when the current account owns it.
+func TestEnsureProjectPrefersValidConfigUUID(t *testing.T) {
+	withFreshProjectCache(t)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"projects":[{"uuid":"22222222-3333-4444-8555-666666666666","title":"Other"},{"uuid":"fallback","title":"CLIProxyAPI"}]}`))
+	}))
+	defer server.Close()
+	withBaseURL(t, server.URL)
 	cfg := defaultConfig()
 	cfg.ProjectUUID = "22222222-3333-4444-8555-666666666666"
 	withConfig(t, cfg, func() {
-		client := &prismClient{credKey: "config-precedence-test"}
-		defer dropProject(client.credKey)
+		client, err := newPrismClient(&storedAuth{Cookies: "c=1"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		client.projectID = ""
 		got, err := client.ensureProject(context.Background())
 		if err != nil {
 			t.Fatalf("ensureProject: %v", err)
 		}
 		if got != cfg.ProjectUUID {
-			t.Errorf("ensureProject = %q, want the configured %q", got, cfg.ProjectUUID)
+			t.Errorf("ensureProject = %q", got)
 		}
 	})
 }
@@ -1592,13 +1628,10 @@ func TestCallbackCodeFromDevToolsPaste(t *testing.T) {
 	}
 }
 
-// The config's user_id / project_uuid are documented as a way to skip the two
-// lookups that would otherwise run on every start. They only work if the client
-// actually reads them, which it did not: hydrate() kept calling /auth/session
-// and ensureProject() kept creating, so the knobs were inert. That matters more
-// than it sounds — /auth/session is a separate endpoint from the turn, and it
-// answered 504 while turns still worked (measured 2026-09-17).
-func TestClientFallsBackToConfigIDs(t *testing.T) {
+// The config's user_id can skip /auth/session immediately. Project UUIDs are
+// intentionally not trusted at construction time because ownership is tied to
+// the current Prism session; ensureProject validates them against the account.
+func TestClientFallsBackToConfigUserID(t *testing.T) {
 	cfg := defaultConfig()
 	cfg.UserID = "user-from-config"
 	cfg.ProjectUUID = "project-from-config"
@@ -1610,8 +1643,8 @@ func TestClientFallsBackToConfigIDs(t *testing.T) {
 		if client.userID != "user-from-config" {
 			t.Errorf("userID = %q, want the configured one", client.userID)
 		}
-		if client.projectID != "project-from-config" {
-			t.Errorf("projectID = %q, want the configured one", client.projectID)
+		if client.projectID != "" {
+			t.Errorf("projectID = %q, want unvalidated until ensureProject", client.projectID)
 		}
 	})
 }
@@ -1633,8 +1666,8 @@ func TestClientPrefersCredentialIDsOverConfig(t *testing.T) {
 		if client.userID != "user-from-credential" {
 			t.Errorf("userID = %q, want the credential's", client.userID)
 		}
-		if client.projectID != "project-from-credential" {
-			t.Errorf("projectID = %q, want the credential's", client.projectID)
+		if client.projectID != "" {
+			t.Errorf("projectID = %q, want unvalidated until ensureProject", client.projectID)
 		}
 	})
 }

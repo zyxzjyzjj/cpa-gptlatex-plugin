@@ -69,7 +69,14 @@ func handleExecuteSync(raw []byte, stream bool) ([]byte, error) {
 		return errorEnvelope("invalid_request", err.Error(), http.StatusBadRequest), nil
 	}
 
-	input, err := buildInput(chat.Messages)
+	cfg := currentConfig()
+	clientToolMode := cfg.ClientTools && len(chat.ClientTools) > 0
+	var input []map[string]any
+	if clientToolMode {
+		input, err = buildClientToolInput(chat.Messages, chat.ClientTools, chat.ToolChoice)
+	} else {
+		input, err = buildInput(chat.Messages)
+	}
 	if err != nil {
 		return errorEnvelope("invalid_request", err.Error(), http.StatusBadRequest), nil
 	}
@@ -77,8 +84,8 @@ func handleExecuteSync(raw []byte, stream bool) ([]byte, error) {
 	// The host log is the only place an operator can see which model prism was
 	// actually asked for; the client-facing error cannot say it.
 	started := time.Now()
-	hostLog("info", fmt.Sprintf("开始 prism 回合 model=%s 消息=%d 输入项=%d stream=%t 请求模型=%s",
-		model, len(chat.Messages), len(input), stream, req.Model), map[string]any{"model": model})
+	hostLog("info", fmt.Sprintf("开始 prism 回合 model=%s 消息=%d 输入项=%d stream=%t 客户端工具=%d 请求模型=%s",
+		model, len(chat.Messages), len(input), stream, len(chat.ClientTools), req.Model), map[string]any{"model": model})
 
 	projectID, err := client.ensureProject(ctx)
 	if err != nil {
@@ -86,7 +93,6 @@ func handleExecuteSync(raw []byte, stream bool) ([]byte, error) {
 		return errorEnvelope("server_error", err.Error(), http.StatusBadGateway), nil
 	}
 
-	cfg := currentConfig()
 	// 冷启动要付沙箱握手（实测 42s：资源令牌 → y-sweet → Yjs 同步），
 	// 缓存命中后同一轮只要几秒。所以这里的耗时按阶段打点，便于判断慢在哪。
 	sandboxMS := int64(0)
@@ -124,18 +130,43 @@ func handleExecuteSync(raw []byte, stream bool) ([]byte, error) {
 	}
 
 	turn := turnRequest{Input: input, Metadata: metadata}
-
-	payload, err := client.runTurn(ctx, turn, 5*time.Second, func() {
-		// 服务端要求重连时缓存的沙箱已经没用了。丢掉之后必须重新领一个并
-		// 覆盖 metadata，否则重试还是带着同一个死沙箱，只会再失败一次。
-		if !cfg.EnableSandbox {
-			return
+	maxToolRounds := 1
+	if clientToolMode && cfg.ClientToolsMaxRounds > 1 {
+		maxToolRounds = cfg.ClientToolsMaxRounds
+	}
+	var payload *turnPayload
+	var toolResult parsedClientTools
+	for round := 1; round <= maxToolRounds; round++ {
+		payload, err = client.runTurn(ctx, turn, 5*time.Second, func() {
+			// 服务端要求重连时缓存的沙箱已经没用了。丢掉之后必须重新领一个并
+			// 覆盖 metadata，否则重试还是带着同一个死沙箱，只会再失败一次。
+			if !cfg.EnableSandbox {
+				return
+			}
+			dropSandbox(projectID)
+			if err := attachSandbox(); err != nil {
+				hostLog("error", "重连时重新领取 prism 沙箱失败", map[string]any{"error": err.Error()})
+			}
+		})
+		if err != nil || !clientToolMode {
+			break
 		}
-		dropSandbox(projectID)
-		if err := attachSandbox(); err != nil {
-			hostLog("error", "重连时重新领取 prism 沙箱失败", map[string]any{"error": err.Error()})
+		toolResult = parseClientToolCalls(payload.Text(), chat.ClientTools)
+		if len(toolResult.Calls) > 0 || len(toolResult.Malformed) == 0 || round >= maxToolRounds {
+			break
 		}
-	})
+		// Model emitted a marker but malformed its JSON. Give it one bounded
+		// correction round; no tool is executed here. Repeat the full preamble:
+		// prism reliably reads only the final user item.
+		correction := fmt.Sprintf("%s\n\n上一次工具调用不是合法 JSON：%s\n请只重新输出一行格式正确的 %s{\\\"name\\\":...,\\\"arguments\\\":{...}}%s",
+			buildClientToolsPreamble(chat.ClientTools, chat.ToolChoice),
+			truncateString(toolResult.Malformed[0], 240), clientToolCallOpen, clientToolCallClose)
+		turn.Input = append(turn.Input,
+			map[string]any{"type": "message", "role": "assistant", "content": []map[string]any{{"type": "output_text", "text": payload.Text()}}},
+			map[string]any{"type": "message", "role": "user", "content": []map[string]any{{"type": "input_text", "text": correction}}},
+		)
+		hostLog("warn", fmt.Sprintf("客户端工具标记 JSON 非法，纠正重试 round=%d", round), nil)
+	}
 	if err != nil {
 		total := time.Since(started).Milliseconds()
 		// Only `model`/`reason`/`error` survive the host's field filter, so the
@@ -166,7 +197,18 @@ func handleExecuteSync(raw []byte, stream bool) ([]byte, error) {
 	}
 
 	text := payload.Text()
-	if strings.TrimSpace(text) == "" {
+	var clientCalls []clientToolCall
+	if clientToolMode {
+		if len(toolResult.Calls) == 0 && len(toolResult.Malformed) == 0 {
+			toolResult = parseClientToolCalls(text, chat.ClientTools)
+		}
+		text = toolResult.Clean
+		clientCalls = assignClientToolCallIDs(toolResult.Calls, firstNonEmpty(payload.ID, streamRequestID(req)))
+		if len(toolResult.Malformed) > 0 && len(clientCalls) == 0 {
+			hostLog("warn", "客户端工具标记无法解析，已从正文移除", nil)
+		}
+	}
+	if strings.TrimSpace(text) == "" && len(clientCalls) == 0 {
 		text = "（prism 未返回可显示的文本）"
 	}
 
@@ -185,7 +227,7 @@ func handleExecuteSync(raw []byte, stream bool) ([]byte, error) {
 	}
 	if isResponsesFormat(req.Format) {
 		if stream {
-			chunks := responsesSSEChunks(model, outputID, text)
+			chunks := responsesSSEChunks(model, outputID, text, clientCalls)
 			started, _ := req.Metadata["prism_started_emitted"].(bool)
 			if !started {
 				created := time.Now().Unix()
@@ -200,7 +242,7 @@ func handleExecuteSync(raw []byte, stream bool) ([]byte, error) {
 			})
 		}
 		return okEnvelope(executorResponse{
-			Payload: responsesCompletion(model, outputID, text),
+			Payload: responsesCompletion(model, outputID, text, clientCalls),
 			Headers: http.Header{"Content-Type": []string{"application/json"}},
 		})
 	}
@@ -212,11 +254,11 @@ func handleExecuteSync(raw []byte, stream bool) ([]byte, error) {
 				"Content-Type":  []string{"text/event-stream"},
 				"Cache-Control": []string{"no-cache"},
 			},
-			Chunks: sseChunks(model, outputID, text),
+			Chunks: sseChunks(model, outputID, text, clientCalls),
 		})
 	}
 	return okEnvelope(executorResponse{
-		Payload: completion(model, outputID, text),
+		Payload: completion(model, outputID, text, clientCalls),
 		Headers: http.Header{"Content-Type": []string{"application/json"}},
 	})
 }
@@ -440,9 +482,12 @@ func (c *prismClient) hydrate(ctx context.Context, sa *storedAuth) error {
 // ------------------------------------------------------------ chat mapping
 
 type chatRequest struct {
-	Model    string        `json:"model"`
-	Messages []chatMessage `json:"messages"`
-	Stream   bool          `json:"stream"`
+	Model       string          `json:"model"`
+	Messages    []chatMessage   `json:"messages"`
+	Stream      bool            `json:"stream"`
+	RawTools    json.RawMessage `json:"tools"`
+	ToolChoice  any             `json:"tool_choice"`
+	ClientTools []clientTool    `json:"-"`
 }
 
 type responsesRequest struct {
@@ -450,11 +495,23 @@ type responsesRequest struct {
 	Instructions string          `json:"instructions"`
 	Input        json.RawMessage `json:"input"`
 	Stream       bool            `json:"stream"`
+	RawTools     json.RawMessage `json:"tools"`
+	ToolChoice   any             `json:"tool_choice"`
 }
 
 type chatMessage struct {
-	Role    string          `json:"role"`
-	Content json.RawMessage `json:"content"`
+	Role       string          `json:"role"`
+	Content    json.RawMessage `json:"content"`
+	ToolCallID string          `json:"tool_call_id,omitempty"`
+	ToolCalls  []struct {
+		ID       string `json:"id"`
+		Type     string `json:"type"`
+		Kind     string `json:"kind,omitempty"`
+		Function struct {
+			Name      string `json:"name"`
+			Arguments string `json:"arguments"`
+		} `json:"function"`
+	} `json:"tool_calls,omitempty"`
 }
 
 func decodeChatRequest(raw []byte) (*chatRequest, error) {
@@ -467,6 +524,9 @@ func decodeChatRequest(raw []byte) (*chatRequest, error) {
 	}
 	if len(req.Messages) == 0 {
 		return nil, fmt.Errorf("messages 为空")
+	}
+	if choice, _ := req.ToolChoice.(string); choice != "none" {
+		req.ClientTools = normalizeClientTools(rawToolValues(req.RawTools))
 	}
 	return &req, nil
 }
@@ -483,7 +543,8 @@ func decodeResponsesRequest(raw []byte) (*chatRequest, error) {
 	if err := json.Unmarshal(raw, &req); err != nil {
 		return nil, fmt.Errorf("无法解析 responses: %w", err)
 	}
-	out := &chatRequest{Model: req.Model, Stream: req.Stream}
+	out := &chatRequest{Model: req.Model, Stream: req.Stream, ToolChoice: req.ToolChoice}
+	toolValues := rawToolValues(req.RawTools)
 	seenInstructions := map[string]struct{}{}
 	appendText := func(role, text string) {
 		text = strings.TrimSpace(text)
@@ -505,19 +566,70 @@ func decodeResponsesRequest(raw []byte) (*chatRequest, error) {
 	var inputText string
 	if json.Unmarshal(req.Input, &inputText) == nil && strings.TrimSpace(inputText) != "" {
 		appendText("user", inputText)
+		if choice, _ := req.ToolChoice.(string); choice != "none" {
+			out.ClientTools = normalizeClientTools(toolValues)
+		}
 		return out, nil
 	}
 	var items []struct {
-		Type    string          `json:"type"`
-		Role    string          `json:"role"`
-		Content json.RawMessage `json:"content"`
+		Type      string          `json:"type"`
+		Role      string          `json:"role"`
+		Content   json.RawMessage `json:"content"`
+		Tools     []any           `json:"tools"`
+		ID        string          `json:"id"`
+		CallID    string          `json:"call_id"`
+		Name      string          `json:"name"`
+		Arguments json.RawMessage `json:"arguments"`
+		Input     json.RawMessage `json:"input"`
+		Output    json.RawMessage `json:"output"`
 	}
 	if err := json.Unmarshal(req.Input, &items); err != nil {
 		return nil, fmt.Errorf("responses.input 不是字符串或数组: %w", err)
 	}
 	for _, item := range items {
 		itemType := strings.TrimSpace(item.Type)
-		if itemType != "" && itemType != "message" {
+		switch itemType {
+		case "additional_tools":
+			toolValues = append(toolValues, item.Tools...)
+			continue
+		case "function_call", "custom_tool_call":
+			kind := "function"
+			payload := string(item.Arguments)
+			if itemType == "custom_tool_call" {
+				kind = "custom"
+				var input string
+				if json.Unmarshal(item.Input, &input) == nil {
+					payload = input
+				} else {
+					payload = string(item.Input)
+				}
+			} else {
+				var argumentText string
+				if json.Unmarshal(item.Arguments, &argumentText) == nil {
+					payload = argumentText
+				}
+			}
+			marker := formatClientToolCallMarker(item.Name, kind, payload)
+			appendText("assistant", marker)
+			continue
+		case "function_call_output", "custom_tool_call_output":
+			output := strings.TrimSpace(flattenContent(item.Output))
+			if output == "" {
+				var text string
+				if json.Unmarshal(item.Output, &text) == nil {
+					output = text
+				} else {
+					output = strings.TrimSpace(string(item.Output))
+				}
+			}
+			appendText("tool", formatClientToolResult(firstNonEmpty(item.CallID, item.ID), output))
+			continue
+		case "reasoning", "item_reference", "":
+			if itemType != "" {
+				continue
+			}
+		case "message":
+		default:
 			continue
 		}
 		role := strings.TrimSpace(item.Role)
@@ -531,6 +643,9 @@ func decodeResponsesRequest(raw []byte) (*chatRequest, error) {
 			continue
 		}
 		appendText(role, text)
+	}
+	if choice, _ := req.ToolChoice.(string); choice != "none" {
+		out.ClientTools = normalizeClientTools(toolValues)
 	}
 	if len(out.Messages) == 0 {
 		return nil, fmt.Errorf("responses.input 没有可发送给 prism 的文本消息")
@@ -715,19 +830,36 @@ func normalizedResponseID(upstreamID string) string {
 	return "resp_" + strings.TrimPrefix(id, "chatcmpl-")
 }
 
-func responsesCompletion(model, upstreamID, text string) []byte {
+func responsesCompletion(model, upstreamID, text string, calls []clientToolCall) []byte {
 	id := normalizedResponseID(upstreamID)
 	messageID := "msg_" + id
-	body := map[string]any{
-		"id": id, "object": "response", "created_at": time.Now().Unix(),
-		"status": "completed", "background": false, "error": nil,
-		"incomplete_details": nil, "model": model,
-		"output": []map[string]any{{
+	output := make([]map[string]any, 0, 1+len(calls))
+	if text != "" || len(calls) == 0 {
+		output = append(output, map[string]any{
 			"id": messageID, "type": "message", "status": "completed", "role": "assistant",
 			"content": []map[string]any{{
 				"type": "output_text", "annotations": []any{}, "logprobs": []any{}, "text": text,
 			}},
-		}},
+		})
+	}
+	for i, call := range calls {
+		item := map[string]any{
+			"id":      fmt.Sprintf("%s_%d", map[bool]string{true: "ctc", false: "fc"}[call.Kind == "custom"], i),
+			"call_id": call.ID, "name": call.Name, "status": "completed",
+		}
+		if call.Kind == "custom" {
+			item["type"] = "custom_tool_call"
+			item["input"] = call.Arguments
+		} else {
+			item["type"] = "function_call"
+			item["arguments"] = call.Arguments
+		}
+		output = append(output, item)
+	}
+	body := map[string]any{
+		"id": id, "object": "response", "created_at": time.Now().Unix(),
+		"status": "completed", "background": false, "error": nil,
+		"incomplete_details": nil, "model": model, "output": output,
 		"usage": map[string]any{
 			"input_tokens": 0, "output_tokens": 0, "total_tokens": 0,
 			"output_tokens_details": map[string]any{"reasoning_tokens": 0},
@@ -768,68 +900,145 @@ func responsesStartedFrame(model, upstreamID string, created int64) []byte {
 	return append(one, two...)
 }
 
-func responsesSSEChunks(model, upstreamID, text string) []streamChunk {
+func responsesSSEChunks(model, upstreamID, text string, calls []clientToolCall) []streamChunk {
 	id := normalizedResponseID(upstreamID)
 	created := time.Now().Unix()
-	messageID := "msg_" + id
 	seq := 3 // 1/2 were emitted by responsesStartedFrame in async mode.
 	next := func() int { value := seq; seq++; return value }
-	itemAdded := map[string]any{
-		"type": "response.output_item.added", "sequence_number": next(), "output_index": 0,
-		"item": map[string]any{"id": messageID, "type": "message", "status": "in_progress", "content": []any{}, "role": "assistant"},
+	chunks := make([]streamChunk, 0, 7+len(calls)*4)
+	output := make([]map[string]any, 0, 1+len(calls))
+	outputIndex := 0
+
+	if text != "" || len(calls) == 0 {
+		messageID := "msg_" + id
+		itemAdded := map[string]any{
+			"type": "response.output_item.added", "sequence_number": next(), "output_index": outputIndex,
+			"item": map[string]any{"id": messageID, "type": "message", "status": "in_progress", "content": []any{}, "role": "assistant"},
+		}
+		part := map[string]any{"type": "output_text", "annotations": []any{}, "logprobs": []any{}, "text": ""}
+		partAdded := map[string]any{
+			"type": "response.content_part.added", "sequence_number": next(),
+			"item_id": messageID, "output_index": outputIndex, "content_index": 0, "part": part,
+		}
+		delta := map[string]any{
+			"type": "response.output_text.delta", "sequence_number": next(),
+			"item_id": messageID, "output_index": outputIndex, "content_index": 0, "delta": text, "logprobs": []any{},
+		}
+		textDone := map[string]any{
+			"type": "response.output_text.done", "sequence_number": next(),
+			"item_id": messageID, "output_index": outputIndex, "content_index": 0, "text": text, "logprobs": []any{},
+		}
+		finalPart := map[string]any{"type": "output_text", "annotations": []any{}, "logprobs": []any{}, "text": text}
+		partDone := map[string]any{
+			"type": "response.content_part.done", "sequence_number": next(),
+			"item_id": messageID, "output_index": outputIndex, "content_index": 0, "part": finalPart,
+		}
+		message := map[string]any{
+			"id": messageID, "type": "message", "status": "completed", "role": "assistant",
+			"content": []map[string]any{finalPart},
+		}
+		itemDone := map[string]any{
+			"type": "response.output_item.done", "sequence_number": next(), "output_index": outputIndex, "item": message,
+		}
+		chunks = append(chunks,
+			responsesSSEEvent("response.output_item.added", itemAdded),
+			responsesSSEEvent("response.content_part.added", partAdded),
+			responsesSSEEvent("response.output_text.delta", delta),
+			responsesSSEEvent("response.output_text.done", textDone),
+			responsesSSEEvent("response.content_part.done", partDone),
+			responsesSSEEvent("response.output_item.done", itemDone),
+		)
+		output = append(output, message)
+		outputIndex++
 	}
-	part := map[string]any{"type": "output_text", "annotations": []any{}, "logprobs": []any{}, "text": ""}
-	partAdded := map[string]any{
-		"type": "response.content_part.added", "sequence_number": next(),
-		"item_id": messageID, "output_index": 0, "content_index": 0, "part": part,
+
+	for i, call := range calls {
+		itemID := fmt.Sprintf("fc_%s_%d", id, i)
+		itemType := "function_call"
+		payloadField := "arguments"
+		deltaType := "response.function_call_arguments.delta"
+		doneType := "response.function_call_arguments.done"
+		if call.Kind == "custom" {
+			itemID = fmt.Sprintf("ctc_%s_%d", id, i)
+			itemType = "custom_tool_call"
+			payloadField = "input"
+			deltaType = "response.custom_tool_call_input.delta"
+			doneType = "response.custom_tool_call_input.done"
+		}
+		base := map[string]any{
+			"id": itemID, "type": itemType, "call_id": call.ID, "name": call.Name,
+		}
+		addedItem := cloneAnyMapLocal(base)
+		addedItem["status"] = "in_progress"
+		addedItem[payloadField] = ""
+		chunks = append(chunks, responsesSSEEvent("response.output_item.added", map[string]any{
+			"type": "response.output_item.added", "sequence_number": next(), "output_index": outputIndex, "item": addedItem,
+		}))
+		if call.Arguments != "" {
+			chunks = append(chunks, responsesSSEEvent(deltaType, map[string]any{
+				"type": deltaType, "sequence_number": next(), "item_id": itemID,
+				"output_index": outputIndex, "delta": call.Arguments,
+			}))
+		}
+		chunks = append(chunks, responsesSSEEvent(doneType, map[string]any{
+			"type": doneType, "sequence_number": next(), "item_id": itemID,
+			"output_index": outputIndex, payloadField: call.Arguments,
+		}))
+		finalItem := cloneAnyMapLocal(base)
+		finalItem["status"] = "completed"
+		finalItem[payloadField] = call.Arguments
+		chunks = append(chunks, responsesSSEEvent("response.output_item.done", map[string]any{
+			"type": "response.output_item.done", "sequence_number": next(), "output_index": outputIndex, "item": finalItem,
+		}))
+		output = append(output, finalItem)
+		outputIndex++
 	}
-	delta := map[string]any{
-		"type": "response.output_text.delta", "sequence_number": next(),
-		"item_id": messageID, "output_index": 0, "content_index": 0, "delta": text, "logprobs": []any{},
-	}
-	textDone := map[string]any{
-		"type": "response.output_text.done", "sequence_number": next(),
-		"item_id": messageID, "output_index": 0, "content_index": 0, "text": text, "logprobs": []any{},
-	}
-	finalPart := map[string]any{"type": "output_text", "annotations": []any{}, "logprobs": []any{}, "text": text}
-	partDone := map[string]any{
-		"type": "response.content_part.done", "sequence_number": next(),
-		"item_id": messageID, "output_index": 0, "content_index": 0, "part": finalPart,
-	}
-	message := map[string]any{
-		"id": messageID, "type": "message", "status": "completed", "role": "assistant",
-		"content": []map[string]any{finalPart},
-	}
-	itemDone := map[string]any{
-		"type": "response.output_item.done", "sequence_number": next(), "output_index": 0, "item": message,
-	}
+
 	completedResponse := map[string]any{
 		"id": id, "object": "response", "created_at": created, "status": "completed",
-		"background": false, "error": nil, "model": model, "output": []map[string]any{message},
+		"background": false, "error": nil, "model": model, "output": output,
 		"usage": map[string]any{
 			"input_tokens": 0, "output_tokens": 0, "total_tokens": 0,
 			"output_tokens_details": map[string]any{"reasoning_tokens": 0},
 			"input_tokens_details":  map[string]any{"cached_tokens": 0},
 		},
 	}
-	completed := map[string]any{
+	chunks = append(chunks, responsesSSEEvent("response.completed", map[string]any{
 		"type": "response.completed", "sequence_number": next(), "response": completedResponse,
-	}
-	return []streamChunk{
-		responsesSSEEvent("response.output_item.added", itemAdded),
-		responsesSSEEvent("response.content_part.added", partAdded),
-		responsesSSEEvent("response.output_text.delta", delta),
-		responsesSSEEvent("response.output_text.done", textDone),
-		responsesSSEEvent("response.content_part.done", partDone),
-		responsesSSEEvent("response.output_item.done", itemDone),
-		responsesSSEEvent("response.completed", completed),
-	}
+	}))
+	return chunks
 }
 
-func completion(model, upstreamID, text string) []byte {
+func cloneAnyMapLocal(source map[string]any) map[string]any {
+	out := make(map[string]any, len(source)+2)
+	for key, value := range source {
+		out[key] = value
+	}
+	return out
+}
+
+func completion(model, upstreamID, text string, calls []clientToolCall) []byte {
 	id := upstreamID
 	if id == "" {
 		id = "prism"
+	}
+	message := map[string]any{"role": "assistant", "content": text}
+	finish := "stop"
+	if len(calls) > 0 {
+		finish = "tool_calls"
+		toolCalls := make([]map[string]any, 0, len(calls))
+		for i, call := range calls {
+			arguments := call.Arguments
+			if call.Kind == "custom" {
+				raw, _ := json.Marshal(map[string]any{"input": call.Arguments})
+				arguments = string(raw)
+			}
+			toolCalls = append(toolCalls, map[string]any{
+				"index": i, "id": call.ID, "type": "function",
+				"function": map[string]any{"name": call.Name, "arguments": arguments},
+			})
+		}
+		message["tool_calls"] = toolCalls
 	}
 	body := map[string]any{
 		"id":      "chatcmpl-" + id,
@@ -837,9 +1046,7 @@ func completion(model, upstreamID, text string) []byte {
 		"created": time.Now().Unix(),
 		"model":   model,
 		"choices": []map[string]any{{
-			"index":         0,
-			"message":       map[string]any{"role": "assistant", "content": text},
-			"finish_reason": "stop",
+			"index": 0, "message": message, "finish_reason": finish,
 		}},
 		"usage": map[string]any{"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
 	}
@@ -850,38 +1057,42 @@ func completion(model, upstreamID, text string) []byte {
 // sseChunks frames the answer as an OpenAI streaming response. Prism delivers
 // the whole turn at once, so this is emitted as a short replay rather than a
 // live stream.
-func sseChunks(model, upstreamID, text string) []streamChunk {
+func sseChunks(model, upstreamID, text string, calls []clientToolCall) []streamChunk {
 	id := upstreamID
 	if id == "" {
 		id = "prism"
 	}
 	created := time.Now().Unix()
 	base := map[string]any{
-		"id":      "chatcmpl-" + id,
-		"object":  "chat.completion.chunk",
-		"created": created,
-		"model":   model,
+		"id": "chatcmpl-" + id, "object": "chat.completion.chunk",
+		"created": created, "model": model,
 	}
 	emit := func(delta map[string]any, finish any) streamChunk {
-		frame := map[string]any{}
-		for k, v := range base {
-			frame[k] = v
-		}
-		choice := map[string]any{"index": 0, "delta": delta}
-		if finish != nil {
-			choice["finish_reason"] = finish
-		} else {
-			choice["finish_reason"] = nil
-		}
-		frame["choices"] = []map[string]any{choice}
+		frame := cloneAnyMapLocal(base)
+		frame["choices"] = []map[string]any{{"index": 0, "delta": delta, "finish_reason": finish}}
 		raw, _ := json.Marshal(frame)
 		return streamChunk{Payload: []byte("data: " + string(raw) + "\n\n")}
 	}
-
-	return []streamChunk{
-		emit(map[string]any{"role": "assistant", "content": ""}, nil),
-		emit(map[string]any{"content": text}, nil),
-		emit(map[string]any{}, "stop"),
-		{Payload: []byte("data: [DONE]\n\n")},
+	chunks := []streamChunk{emit(map[string]any{"role": "assistant", "content": ""}, nil)}
+	if text != "" {
+		chunks = append(chunks, emit(map[string]any{"content": text}, nil))
 	}
+	if len(calls) > 0 {
+		for i, call := range calls {
+			arguments := call.Arguments
+			if call.Kind == "custom" {
+				raw, _ := json.Marshal(map[string]any{"input": call.Arguments})
+				arguments = string(raw)
+			}
+			chunks = append(chunks, emit(map[string]any{"tool_calls": []map[string]any{{
+				"index": i, "id": call.ID, "type": "function",
+				"function": map[string]any{"name": call.Name, "arguments": arguments},
+			}}}, nil))
+		}
+		chunks = append(chunks, emit(map[string]any{}, "tool_calls"))
+	} else {
+		chunks = append(chunks, emit(map[string]any{}, "stop"))
+	}
+	chunks = append(chunks, streamChunk{Payload: []byte("data: [DONE]\n\n")})
+	return chunks
 }

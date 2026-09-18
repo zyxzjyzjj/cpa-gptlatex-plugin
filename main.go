@@ -90,7 +90,7 @@ const (
 
 // version is a var, not a const, so the build scripts can inject it with
 // -ldflags "-X main.version=...".
-var version = "0.3.0"
+var version = "0.3.1"
 
 // ABI and protocol versions, mirrored from CPA's sdk/pluginabi rather than
 // imported so the plugin builds against no CLIProxyAPI release in particular.
@@ -516,6 +516,8 @@ func reg() registration {
 				{Name: "reasoning_effort", Type: "enum", EnumValues: []string{"low", "medium", "high", "xhigh"}, Description: "思考档位"},
 				{Name: "sandbox", Type: "boolean", Description: "领取 LaTeX 沙箱并完成工作区同步（默认开；关掉则服务端只会返回 sandbox_reconnecting，拿不到答案）"},
 				{Name: "system_prompt", Type: "string", Description: "覆盖默认 system prompt"},
+				{Name: "client_tools", Type: "boolean", Description: "把客户端 tools/additional_tools 翻译给 prism，工具由客户端本机执行（默认开）"},
+				{Name: "client_tools_max_rounds", Type: "integer", Description: "工具调用标记格式错误时的最大纠正轮数（默认 2）"},
 			},
 		},
 		Capabilities: capabilities{

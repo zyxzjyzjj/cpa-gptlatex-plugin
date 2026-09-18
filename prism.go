@@ -206,19 +206,16 @@ func newPrismClient(sa *storedAuth) (*prismClient, error) {
 	if strings.TrimSpace(sa.Cookies) == "" {
 		return nil, fmt.Errorf("缺少 prism cookie")
 	}
-	// The credential is authoritative, but the config's user_id / project_uuid
-	// are a documented way to skip the two lookups that would otherwise run on
-	// every start. Without this fallback those knobs did nothing at all.
+	// user_id is safe to reuse directly. Project UUID is different: ownership is
+	// tied to the current Prism session, so ensureProject validates credential /
+	// config candidates against the current account before accepting either.
 	if sa.UserID == "" {
 		sa.UserID = currentConfig().UserID
-	}
-	if sa.ProjectID == "" {
-		sa.ProjectID = currentConfig().ProjectUUID
 	}
 	return &prismClient{
 		http:      &http.Client{Timeout: 180 * time.Second},
 		cookies:   sa.Cookies,
-		projectID: sa.ProjectID,
+		projectID: "",
 		userID:    sa.UserID,
 		auth:      sa,
 		credKey:   credentialKey(sa.Cookies),
@@ -328,21 +325,35 @@ func (c *prismClient) ensureProject(ctx context.Context) (string, error) {
 	if c.projectID != "" {
 		return c.projectID, nil
 	}
-	if cfg.ProjectUUID != "" {
-		c.projectID = cfg.ProjectUUID
-		return c.projectID, nil
-	}
 	if cached, ok := lookupProject(c.credKey); ok {
 		c.projectID = cached
 		return cached, nil
 	}
 
-	// Creating one is cheap and, unlike the list endpoint, was the reliable call
-	// during prism's 2026-09-17 storage incident (create answered 200 while
-	// /api/file-management/projects kept timing out). The id is written back to
-	// the credential below, so this happens once per credential rather than
-	// once per process start — before that, each restart left another project
-	// behind and 14 had accumulated.
+	// Project ownership is tied to the Prism session. A configured or persisted
+	// UUID is a candidate, not an eternal truth: after re-login the old UUID may
+	// belong to a different session and resources-token returns 404. Validate
+	// candidates against the current account's project list before reuse.
+	projects, listErr := c.listProjects(ctx)
+	candidates := []string{c.auth.ProjectID, cfg.ProjectUUID}
+	for _, candidate := range candidates {
+		if projectExists(projects, candidate) {
+			c.setProject(candidate)
+			hostLog("info", "复用当前会话绑定的 prism 项目 project="+candidate, nil)
+			return candidate, nil
+		}
+	}
+	if matched := projectByTitle(projects, cfg.ProjectTitle); matched != "" {
+		c.setProject(matched)
+		hostLog("info", "按标题复用当前账号的 prism 项目 project="+matched, nil)
+		return matched, nil
+	}
+	if len(projects) > 0 {
+		c.setProject(projects[0].UUID)
+		hostLog("info", "复用当前账号已有的 prism 项目 project="+projects[0].UUID, nil)
+		return projects[0].UUID, nil
+	}
+
 	id := newUUID()
 	body := map[string]any{
 		"project_uuid": id,
@@ -352,27 +363,65 @@ func (c *prismClient) ensureProject(ctx context.Context) (string, error) {
 	var resp struct {
 		UUID string `json:"uuid"`
 	}
-	if err := c.do(ctx, http.MethodPost, "/api/projects", body, &resp); err == nil {
-		if resp.UUID == "" {
-			resp.UUID = id
+	if err := c.do(ctx, http.MethodPost, "/api/projects", body, &resp); err != nil {
+		if listErr != nil {
+			return "", fmt.Errorf("列举项目失败 (%v)，创建项目也失败: %w", listErr, err)
 		}
-		c.setProject(resp.UUID)
-		return c.projectID, nil
-	} else {
-		// A turn needs *a* project, not a fresh one — nothing in a turn depends
-		// on the workspace contents — so an existing project is a fine fallback
-		// when creation is refused.
-		hostLog("warn", "创建 prism 项目失败，改用已有项目 error="+err.Error(), nil)
-		// Any project will do here: the turn needs a workspace id, not this
-		// plugin's own workspace, so an unrelated project beats failing.
-		fallback, fallbackErr := c.findOwnProject(ctx, "")
-		if fallbackErr != nil || fallback == "" {
-			return "", fmt.Errorf("创建 prism 项目失败: %w", err)
-		}
-		hostLog("info", "复用账户里已有的 prism 项目 project="+fallback, nil)
-		c.setProject(fallback)
-		return c.projectID, nil
+		return "", fmt.Errorf("创建 prism 项目失败: %w", err)
 	}
+	if resp.UUID == "" {
+		resp.UUID = id
+	}
+	c.setProject(resp.UUID)
+	return c.projectID, nil
+}
+
+type prismProject struct {
+	UUID    string `json:"uuid"`
+	Title   string `json:"title"`
+	Deleted bool   `json:"deleted"`
+}
+
+func (c *prismClient) listProjects(ctx context.Context) ([]prismProject, error) {
+	var out struct {
+		Projects []prismProject `json:"projects"`
+	}
+	if err := c.do(ctx, http.MethodGet, "/api/file-management/projects?section=your_projects", nil, &out); err != nil {
+		return nil, err
+	}
+	active := out.Projects[:0]
+	for _, project := range out.Projects {
+		if !project.Deleted && strings.TrimSpace(project.UUID) != "" {
+			active = append(active, project)
+		}
+	}
+	return active, nil
+}
+
+func projectExists(projects []prismProject, id string) bool {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return false
+	}
+	for _, project := range projects {
+		if project.UUID == id {
+			return true
+		}
+	}
+	return false
+}
+
+func projectByTitle(projects []prismProject, title string) string {
+	title = strings.TrimSpace(title)
+	if title == "" {
+		return ""
+	}
+	for _, project := range projects {
+		if project.Title == title {
+			return project.UUID
+		}
+	}
+	return ""
 }
 
 // setProject records the project for this credential in memory and on disk.
@@ -380,31 +429,6 @@ func (c *prismClient) setProject(id string) {
 	c.projectID = id
 	rememberProject(c.credKey, id)
 	rememberProjectID(c.auth, id)
-}
-
-// findOwnProject returns the newest existing project, preferring one whose
-// title matches what this plugin creates. An empty title accepts any project.
-func (c *prismClient) findOwnProject(ctx context.Context, title string) (string, error) {
-	var out struct {
-		Projects []struct {
-			UUID    string `json:"uuid"`
-			Title   string `json:"title"`
-			Deleted bool   `json:"deleted"`
-		} `json:"projects"`
-	}
-	if err := c.do(ctx, http.MethodGet, "/api/file-management/projects?section=your_projects", nil, &out); err != nil {
-		return "", err
-	}
-	// The list arrives newest first, so the first match is the most recent one.
-	for _, p := range out.Projects {
-		if p.Deleted || p.UUID == "" {
-			continue
-		}
-		if title == "" || p.Title == title {
-			return p.UUID, nil
-		}
-	}
-	return "", fmt.Errorf("账户里没有可复用的 prism 项目")
 }
 
 // ------------------------------------------------------------- turns

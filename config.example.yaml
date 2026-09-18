@@ -21,6 +21,14 @@ plugins:
       reasoning_effort: "medium"   # low | medium | high | xhigh
       system_prompt: ""
 
+      # Client tool bridge (enabled by default). When Codex/ZCode sends tools or
+      # Responses input[].additional_tools, the plugin asks prism to emit a tool
+      # request and returns it as a standard function_call/custom_tool_call.
+      # Execution stays on the client machine; the remote CPA never reads local
+      # files itself. Disable only for clients that do not run tool loops.
+      client_tools: true
+      client_tools_max_rounds: 2
+
       # Leave both empty to use the model list prism itself publishes (it comes
       # from a feature flag the web client reads, and it rotates — a hardcoded
       # name stops working without warning). Fill them in only to pin models.

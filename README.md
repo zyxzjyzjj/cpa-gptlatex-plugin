@@ -245,6 +245,36 @@ curl -s http://127.0.0.1:8319/v1/chat/completions \
        "messages":[{"role":"user","content":"用一句话解释 LaTeX 的 \\label 有什么用"}]}'
 ```
 
+### 让 Codex / ZCode 读取本机项目文件
+
+插件默认开启**客户端工具桥**（`client_tools: true`）。远程 CPA 不直接读取你电脑的磁盘；它把 Prism 输出的工具请求翻译成标准 OpenAI `function_call` / `custom_tool_call`，由本机 Codex、ZCode 或其他 agent 客户端执行，再把工具结果发回下一轮。
+
+```text
+Prism 模型 → 标准 tool call → 本地 Codex/ZCode 执行 → tool result → Prism 最终回答
+```
+
+这适合远程 CPA + 本地工作区：Codex CLI 0.154.0 把工具定义放在 Responses 的 `input[].additional_tools` 中（含 namespace/custom `exec`），插件会识别该形状，也兼容标准 Chat/Responses `tools`。只有请求实际声明工具时才激活；普通聊天无额外提示词和解析开销。
+
+安全边界：
+
+- 工具由**客户端本机**执行，CPA 服务器不会得到本机文件系统权限。
+- 插件只会返回客户端自己声明过的工具；模型伪造的未声明工具会被拒绝。
+- 工具调用 ID 稳定，可用 `function_call_output` / `custom_tool_call_output` 或 Chat `role: tool` 回灌。
+- 模型输出格式错误时最多纠正 `client_tools_max_rounds` 次（默认 2），不会执行任何工具。
+- 若客户端只是普通网页、没有本地工具执行器，仍需要本地 companion/MCP Client；远程服务器无法凭空读取浏览器所在电脑的目录。
+
+配置：
+
+```yaml
+plugins:
+  configs:
+    prism-provider:
+      client_tools: true
+      client_tools_max_rounds: 2
+```
+
+真实验收已覆盖：Responses `function_call`、Codex `additional_tools → custom_tool_call exec`、两种工具结果回灌，以及 Chat Completions `tool_calls`。
+
 ### 如果返回 403 / Cloudflare
 
 **这不是 cookie 的问题，是出口 IP 的问题。** 2026-09-17 实测：本机直连时，**连首页 `/` 都会被拦**，返回 4577 字节的 `Attention Required!` 拦截页，而且**带不带 cookie 响应逐字节相同**；改走美国出口后，同一个请求 `/auth/session` 直接 200、首页 132 KB 正常渲染。所以补 `cf_clearance` 没有用，也**不需要**任何 TLS 指纹伪装。
@@ -274,12 +304,13 @@ $env:HTTPS_PROXY="socks5://127.0.0.1:15732"; .\cli-proxy-api.exe -config config.
 ## 5. 已知限制
 
 - **cookie 会过期。** 目前 `auth.refresh` 只做校验并把 `NextRefreshAfter` 定在 12 小时后；cookie 失效时会返回 401，需要重新粘贴 cookie。
-- **不支持流式增量。** Prism 是「start + 轮询」而非 SSE，答案一次产出，所以 `execute_stream` 走的是 CPA 的**同步 chunks** 通道（一次性回放），不是逐 token 推送。要做到真正的增量得改用 `host.stream.emit`；插件现在**已经**具备调用宿主回调的能力（`host.log` 就是这么走的，见 `callHost`），但仍刻意不碰 `host.stream.emit`——它的 wire 契约在 SDK 里没有文档化的例子，猜错会直接破坏流式响应。
+- **流式连接已使用 CPA 的异步 `host.stream.emit/close`。** 插件立即返回合法的 Responses/Chat 首事件，后台等待 Prism，并每 10 秒发送保活；长请求实测 197 秒仍保持 HTTP 200、TTFB 约 5ms。Prism 当前仍主要在终态给出完整正文，所以不是逐 token 流；下一步可把 `codex_live_progress.eventPreviews` 直接翻成增量事件。
 - **`executor.count_tokens` 是桩，恒返回 `total_tokens: 0`。** Prism 不回报 usage，也没有分词器；这里选择与 CPA 自带参考插件完全一致的返回，而不是编一个估算值。若客户端依赖它做上下文预检，会看到 0。
-- **沙箱是必需的，不是可选项。** 实测：不提供 `sandbox_url` 时服务端只回 `sandbox_reconnecting`，整轮永不成功；而只领沙箱不做后续握手，`wait-for-sync` 会一直停在 `syncing`，`response_with_tools_start` 在 prism 自己的网关超时（约 123 秒）后以 504 失败。插件现在会完整走完这一步（见 `docs/prism-protocol.md` A8.3）：项目资源令牌 → y-sweet 令牌（原样转发给沙箱 `/token`）→ 连上 Yjs socket 并保持 → 轮询 `wait-for-sync` 到 `synced`。**那条 WebSocket 必须全程保持**，插掉沙箱就会退回 `syncing`；插件按项目缓存整套（TTL 10 分钟），传输层出错会自动丢弃并重新领取。
-- **多轮对话是"无状态"的。** 每次请求都把完整的 `messages` 转成 `input` 发上去，不维护 `previousResponseId` / `conversationId`。实测 Prism 网页端只用 2 条 input + `previousResponseId` 做续接，语义不同；本插件走的是 chat-completions 的全量历史语义，能正常工作但每轮上传的上下文更大。
-- **上游调用用标准库 `net/http`，没有走 `host.http.do` 桥。** 功能上等价，但会绕过宿主的代理与请求日志策略。要接管这部分，把 `prismClient.do` 换成宿主桥即可（只有一个函数）。
-- **模型名不校验。** `models` 里的名字会原样发给 `metadata.model`；Prism 侧实际支持哪些模型以网页端 `useAvailableCodexModels()` 为准。
+- **沙箱是必需的，不是可选项。** 插件执行完整握手（项目资源令牌 → y-sweet token → Yjs socket → `wait-for-sync`），每 10 秒 heartbeat 保活，按项目缓存 45 分钟；连续心跳失败或上游明确要求重连时才重新领取。
+- **项目 UUID 与登录凭据绑定。** 凭据/配置中的 UUID 只作为候选，插件会先验证它属于当前账号；失效的旧项目会自动替换为当前账号已有项目并写回凭据，避免换账号后稳定 404。
+- **历史仍由插件携带。** 普通请求保留文本消息；Responses replay 中无文本的 reasoning/tool 结构会跳过。客户端工具桥会把工具调用和结果改写成自洽的文本协议，并按 1.8MB 上限从最旧历史开始裁剪。
+- **上游调用用标准库 `net/http`，没有走 `host.http.do` 桥。** 它会读取 CPA 进程的 `HTTP_PROXY`/`HTTPS_PROXY`，但不会进入宿主的统一请求日志策略。
+- **模型清单由上游 Statsig 动态配置读取并缓存。** 请求模型会对当前目录校验；过期名称会在打上游前返回可用清单。
 
 ---
 
@@ -291,8 +322,9 @@ $env:HTTPS_PROXY="socks5://127.0.0.1:15732"; .\cli-proxy-api.exe -config config.
 | `config.go` | 解析 `plugins.configs.prism-provider` YAML |
 | `auth.go` | `auth.parse` / `auth.refresh` / `model.static` / `model.for_auth` |
 | `prism.go` | Prism HTTP 客户端：会话、建项目、start/status 轮询、沙箱 |
-| `executor.go` | chat-completions ↔ Prism Responses 风格 `input` 的互转，以及响应封装 |
-| `prism_test.go` | 单元测试：配置解析、消息映射、响应封装、凭据 |
+| `executor.go` | Chat/Responses 请求归一化、异步流、请求去重和响应封装 |
+| `client_tools.go` | 客户端工具桥：工具定义归一化、提示协议、调用解析、结果回灌与历史裁剪 |
+| `prism_test.go` / `client_tools_test.go` | 配置、消息、项目绑定、工具桥、响应协议和凭据回归测试 |
 | `build.sh` | 找编译器并构建（无 make 时用这个） |
 | `build.bat` / `release.bat` | Windows 上的构建与发布脚本 |
 | `tools/set-version.ps1` | 把 tag 版本号同步进 main.go 与两份 registry |

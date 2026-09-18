@@ -11,14 +11,16 @@ import (
 
 // config is the parsed form of the `plugins.configs.prism-provider` YAML block.
 type config struct {
-	Cookies         string
-	UserID          string
-	ProjectUUID     string
-	ProjectTitle    string
-	Models          []string
-	DefaultModel    string
-	ReasoningEffort string
-	SystemPrompt    string
+	Cookies              string
+	UserID               string
+	ProjectUUID          string
+	ProjectTitle         string
+	Models               []string
+	DefaultModel         string
+	ReasoningEffort      string
+	SystemPrompt         string
+	ClientTools          bool
+	ClientToolsMaxRounds int
 	// EnableSandbox 决定是否在对话前领取沙箱并把凭证放进 metadata。
 	// **这不是可选项**：实测（2026-09-17）不提供 sandbox_url 时服务端只会一直
 	// 返回 sandbox_reconnecting，整轮永远不会成功，因此默认开启。
@@ -36,9 +38,11 @@ func defaultConfig() config {
 		// Models 留空表示"按上游下发的清单走"：prism 的可选模型由 Statsig
 		// 动态配置决定，写死会过期（gpt-6-astra 一天之间就从可用变成 400）。
 		// 填了就在这里覆盖，供需要固定模型的部署使用。
-		Models:          nil,
-		DefaultModel:    "",
-		ReasoningEffort: "medium",
+		Models:               nil,
+		DefaultModel:         "",
+		ReasoningEffort:      "medium",
+		ClientTools:          true,
+		ClientToolsMaxRounds: 2,
 		// 没有沙箱就拿不到答案。
 		EnableSandbox: true,
 	}
@@ -98,6 +102,14 @@ func configure(raw []byte) error {
 	}
 	if v, ok := flat["system_prompt"].(string); ok {
 		next.SystemPrompt = v
+	}
+	if v, ok := flat["client_tools"].(bool); ok {
+		next.ClientTools = v
+	}
+	if v, ok := flat["client_tools_max_rounds"].(int); ok && v > 0 {
+		next.ClientToolsMaxRounds = v
+	} else if v, ok := flat["client_tools_max_rounds"].(float64); ok && v > 0 {
+		next.ClientToolsMaxRounds = int(v)
 	}
 	if v, ok := flat["sandbox"].(bool); ok {
 		next.EnableSandbox = v
